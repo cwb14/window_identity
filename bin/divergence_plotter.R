@@ -14,13 +14,15 @@ show_help <- function() {
 Description:
   This script reads a TSV file containing chromosome data with associated sequence divergence values.
   It then plots these values across the chromosomes with line breaks at positions without alignment data (denoted by 'NA').
+  Optionally, it includes mean lines from .report files if 'include_mean_line' is specified.
 
 Usage:
-  Rscript divergence_plotter.R <input_file>
+  Rscript divergence_plotter.R <input_file> [include_mean_line]
 
 Arguments:
-  <input_file>  A TSV file with columns: chromosome, start_position, end_position, accession_1, accession_2, ..., accession_n.
-                Columns for accession values should be numeric or 'NA' to denote missing data.
+  <input_file>         A TSV file with columns: chromosome, start_position, end_position, accession_1, accession_2, ..., accession_n.
+                       Columns for accession values should be numeric or 'NA' to denote missing data.
+  [include_mean_line]  Optional boolean argument. If provided, includes mean lines from .report files.
 
 Input Data Example:
   chromosome    start_position  end_position  Y476h2       WWSL
@@ -34,18 +36,19 @@ Output:
   A PDF file named <input_file>_weighted_avg_de_across_chromosomes.pdf containing the plotted data.
 
 Example:
-  Rscript divergence_plotter.R weighted_average.bed
+  Rscript divergence_plotter.R weighted_average.bed include_mean_line
 
 ")
 }
 
 # Read arguments from the command line.
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) != 1) {
+if (length(args) < 1 || length(args) > 2) {
   show_help()
   quit(status = 1)
 }
 input_file <- args[1]
+include_mean_line <- ifelse(length(args) == 2, TRUE, FALSE)
 
 # Read Data.
 data <- read.csv(input_file, sep = "\t", header = TRUE, na.strings = "NA")
@@ -75,7 +78,7 @@ plot_border_theme <- theme(
   plot.margin = margin(1, 1, 1, 1, "lines")
 )
 
-# Create the plot.
+# Create the base plot.
 p <- ggplot(data_long, aes(x = start_position / 1e6, y = value, color = accession, group = accession)) +
   geom_line(na.rm = TRUE) + # Remove NA values to break the line.
   geom_point(size = 0, show.legend = TRUE) +
@@ -89,6 +92,29 @@ p <- ggplot(data_long, aes(x = start_position / 1e6, y = value, color = accessio
   scale_color_manual(values = color_palette, guide = guide_legend(override.aes = list(shape = 15, size = 6))) +
   scale_x_continuous(expand = c(0, 0)) +
   scale_y_continuous(expand = expansion(mult = c(0.005, 0.01)))
+
+# If include_mean_line is TRUE, add geom_hline for each accession based on .report files.
+if (include_mean_line) {
+  # Read .report files.
+  report_files <- list.files(pattern = "\\.report$")
+  for (file in report_files) {
+    report_data <- read.csv(file, sep = "\t", header = TRUE)
+    accession <- sub(".*\\.(.*)\\.report", "\\1", file)
+    
+    # Filter out WholeGenome rows
+    report_data <- report_data[report_data$chromosome != "WholeGenome",]
+    
+    # Match the color of the accession line
+    accession_color <- color_palette[which(unique(data_long$accession) == accession)]
+    
+    # Add horizontal lines for each chromosome.
+    for (chrom in unique(report_data$chromosome)) {
+      avg_de <- report_data$avg_weighted_de[report_data$chromosome == chrom]
+      p <- p + geom_hline(data = data.frame(chromosome = chrom, avg_de = avg_de),
+                          aes(yintercept = avg_de), color = accession_color, linetype = "dotted")
+    }
+  }
+}
 
 # Save the plot to a PDF file.
 output_file <- sub(".txt$", "_weighted_avg_de_across_chromosomes.pdf", input_file)

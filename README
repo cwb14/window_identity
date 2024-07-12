@@ -1,31 +1,7 @@
-### Plotting gap compresses sequence identy across chromosomes using weighted averages to calculate sequence identy per window.
+### Plotting gap compresses sequence identy across chromosomes using weighted averages to calculate sequence identity per window.
 ### Supports 1v1, 1v2, 1v3, etc.
 ### Below, we'll do 1v2. NIPT2T vs Y476h1 Y476h2.
+bash wrapper.sh -ref NIPT2T.fa -query Y476h*.fa
+# Alternatively written as:
+bash wrapper.sh -ref NIPT2T.fa -query Y476h1.fa Y476h2.fa
 
-# Align the Y476h1 and Y476h2 to the reference. 
-minimap2 -c -t 40 --secondary=no -x asm5 NIPT2T.fa Y476h1.fa >  NIPT2T.Y476h1.paf
-minimap2 -c -t 40 --secondary=no -x asm5 NIPT2T.fa Y476h2.fa >  NIPT2T.Y476h2.paf
-
-# Create a windows file for the reference.
-# 1Mb window with 500Kb slide.
-samtools faidx NIPT2T.fa 
-bedtools makewindows -g <( cut -f 1,2 NIPT2T.fa.fai) -w 1000000 -s 500000 > NIPT2T_1Mb_window.bed
-
-# Convert PAF to bed.
-cat NIPT2T.Y476h2.paf | cut -f 6,8,9,21 > NIPT2T.Y476h2.paf.bed
-cat NIPT2T.Y476h1.paf | cut -f 6,8,9,21 > NIPT2T.Y476h1.paf.bed
-
-# Associate each alignment with appropriate window(s) and calculate a weight of each de score based on the fraction of overlap in the window..
-python weighted_de_scores.py -window_bed NIPT2T_1Mb_window.bed -minimap_bed NIPT2T.Y476h1.paf.bed -output NIPT2T.Y476h1.weighted_de.tsv &
-python weighted_de_scores.py -window_bed NIPT2T_1Mb_window.bed -minimap_bed NIPT2T.Y476h2.paf.bed -output NIPT2T.Y476h2.weighted_de.tsv &
-
-# Use weighted average to generate de scores per window.
-# ID (Y476h1 & and Y476h2) is used for the header, which ultimately gets used in the Rplot legend.
-python weighted_de_average.py NIPT2T.Y476h1.weighted_de.tsv Y476h1 > NIPT2T.Y476h1.weighted_de_avg.bed
-python weighted_de_average.py NIPT2T.Y476h2.weighted_de.tsv Y476h2 > NIPT2T.Y476h2.weighted_de_avg.bed
-
-# If there are multipe alignments to the reference, as is the case here (NIPT2T.Y476h1.weighted_de_avg.bed NIPT2T.Y476h2.weighted_de_avg.bed), merge them by overlap.
-python window_merger.py NIPT2T.Y476h1.weighted_de_avg.bed NIPT2T.Y476h2.weighted_de_avg.bed -o merged.weighted_de_avg.bed
-
-# Build the R plot. 
-Rscript divergence_plotter.R merged.weighted_de_avg.bed
