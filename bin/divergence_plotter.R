@@ -101,10 +101,10 @@ if (include_mean_line) {
     report_data <- read.csv(file, sep = "\t", header = TRUE)
     accession <- sub(".*\\.(.*)\\.report", "\\1", file)
     
-    # Filter out WholeGenome rows
+    # Filter out WholeGenome rows.
     report_data <- report_data[report_data$chromosome != "WholeGenome",]
     
-    # Match the color of the accession line
+    # Match the color of the accession line.
     accession_color <- color_palette[which(unique(data_long$accession) == accession)]
     
     # Add horizontal lines for each chromosome.
