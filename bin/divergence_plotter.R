@@ -14,15 +14,17 @@ show_help <- function() {
 Description:
   This script reads a TSV file containing chromosome data with associated sequence divergence values.
   It then plots these values across the chromosomes with line breaks at positions without alignment data (denoted by 'NA').
-  Optionally, it includes mean lines from .report files if 'include_mean_line' is specified.
+  Optionally, it includes mean lines from .report files if '-include_mean_line yes' is specified.
+  Theres a known bug, where '-include_mean_line yes', causes chromosome panels to be presented in non-numeric order. Not sure why. Issue is occurs in ggplot or immediately prior.
 
 Usage:
-  Rscript divergence_plotter.R <input_file> [include_mean_line]
+  Rscript divergence_plotter.R -in <input_file> -include_mean_line <yes|no> -ymax [INT]
 
 Arguments:
-  <input_file>         A TSV file with columns: chromosome, start_position, end_position, accession_1, accession_2, ..., accession_n.
-                       Columns for accession values should be numeric or 'NA' to denote missing data.
-  [include_mean_line]  Optional boolean argument. If provided, includes mean lines from .report files.
+  -in <input_file>              A TSV file with columns: chromosome, start_position, end_position, accession_1, accession_2, ..., accession_n.
+                                Columns for accession values should be numeric or 'NA' to denote missing data.
+  -include_mean_line <yes|no>   Optional argument. If 'yes', includes mean lines from .report files. Default is 'no'.
+  -ymax [INT]                   Optional integer argument. If provided, overrides the Y-axis maximum value with the specified integer.
 
 Input Data Example:
   chromosome    start_position  end_position  Y476h2       WWSL
@@ -36,25 +38,44 @@ Output:
   A PDF file named <input_file>_weighted_avg_de_across_chromosomes.pdf containing the plotted data.
 
 Example:
-  Rscript divergence_plotter.R weighted_average.bed include_mean_line
+  Rscript divergence_plotter.R -in weighted_average.bed -include_mean_line yes -ymax 0.04
 
 ")
 }
 
 # Read arguments from the command line.
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) < 1 || length(args) > 2) {
+
+# Initialize default values.
+input_file <- NULL
+include_mean_line <- "no"
+ymax <- NULL
+
+# Parse arguments.
+for (i in seq(1, length(args), by = 2)) {
+  if (args[i] == "-in") {
+    input_file <- args[i + 1]
+  } else if (args[i] == "-ymax") {
+    ymax <- as.numeric(args[i + 1])
+  } else if (args[i] == "-include_mean_line") {
+    include_mean_line <- args[i + 1]
+  }
+}
+
+# Check if input file is provided.
+if (is.null(input_file) || !(include_mean_line %in% c("yes", "no"))) {
   show_help()
   quit(status = 1)
 }
-input_file <- args[1]
-include_mean_line <- ifelse(length(args) == 2, TRUE, FALSE)
 
-# Read Data.
+# Read data.
 data <- read.csv(input_file, sep = "\t", header = TRUE, na.strings = "NA")
 
 # Get the column names for accession values.
 accession_cols <- names(data)[!(names(data) %in% c("chromosome", "start_position", "end_position"))]
+
+# Sort accession columns.
+accession_cols <- sort(accession_cols)
 
 # Convert chromosome names to a factor with the correct order.
 chrom_levels <- unique(data$chromosome)
@@ -90,28 +111,38 @@ p <- ggplot(data_long, aes(x = start_position / 1e6, y = value, color = accessio
   theme_minimal() +
   plot_border_theme +
   scale_color_manual(values = color_palette, guide = guide_legend(override.aes = list(shape = 15, size = 6))) +
-  scale_x_continuous(expand = c(0, 0)) +
-  scale_y_continuous(expand = expansion(mult = c(0.005, 0.01)))
+  scale_x_continuous(expand = c(0, 0))
 
-# If include_mean_line is TRUE, add geom_hline for each accession based on .report files.
-if (include_mean_line) {
-  # Read .report files.
+# Apply Y-axis scaling if ymax is provided.
+if (!is.null(ymax)) {
+  p <- p + scale_y_continuous(limits = c(0, ymax), expand = expansion(mult = c(0.005, 0.01)))
+} else {
+  p <- p + scale_y_continuous(expand = expansion(mult = c(0.005, 0.01)))
+}
+
+# If include_mean_line is "yes", add geom_hline for each accession based on .report files.
+if (include_mean_line == "yes") {
+  # Read .report files with flexible naming.
   report_files <- list.files(pattern = "\\.report$")
   for (file in report_files) {
     report_data <- read.csv(file, sep = "\t", header = TRUE)
-    accession <- sub(".*\\.(.*)\\.report", "\\1", file)
+    accession <- sub(".*\\.([^\\.]+)\\.report", "\\1", file)
+    
+    # Adjust column name if necessary.
+    if ("avg_snp_fract" %in% colnames(report_data)) {
+      colnames(report_data)[colnames(report_data) == "avg_snp_fract"] <- "avg_weighted_de"
+    }
     
     # Filter out WholeGenome rows.
     report_data <- report_data[report_data$chromosome != "WholeGenome",]
     
     # Match the color of the accession line.
-    accession_color <- color_palette[which(unique(data_long$accession) == accession)]
+    accession_color <- color_palette[which(sort(unique(data_long$accession)) == accession)]
     
-    # Add horizontal lines for each chromosome.
+    # Add horizontal mean lines for each chromosome.
     for (chrom in unique(report_data$chromosome)) {
       avg_de <- report_data$avg_weighted_de[report_data$chromosome == chrom]
-      p <- p + geom_hline(data = data.frame(chromosome = chrom, avg_de = avg_de),
-                          aes(yintercept = avg_de), color = accession_color, linetype = "dotted")
+      p <- p + geom_hline(aes(yintercept = avg_de), data = data.frame(chromosome = chrom), color = accession_color, linetype = "dotted")
     }
   }
 }
