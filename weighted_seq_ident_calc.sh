@@ -230,15 +230,15 @@ if [ "$clean" = true ]; then
     rm "$window_bed"
     for i in "${!queries[@]}"; do
         if [ "$use_snps" = true ]; then
-            rm "${ref_basename}.${query_basename}.sorted.bam"
-            rm "${vcf_files[$i]}"
-            rm "${snp_avg_beds[$i]}"
-            rm "${snp_avg_reports[$i]}"
+#            rm -f "${ref_basename}.${query_basename}.sorted.bam"
+#            rm -f "${vcf_files[$i]}"
+            rm -f "${snp_avg_beds[$i]}"
+#            rm -f "${snp_avg_reports[$i]}"
         else
-            rm "${output_pafs[$i]}"
-            rm "${output_beds[$i]}"
-            rm "${weighted_de_tsvs[$i]}"
-            rm "${weighted_de_avg_beds[$i]}"
+#            rm -f "${output_pafs[$i]}"
+            rm -f "${output_beds[$i]}"
+            rm -f "${weighted_de_tsvs[$i]}"
+            rm -f "${weighted_de_avg_beds[$i]}"
         fi
     done
 fi
