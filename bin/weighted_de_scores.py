@@ -3,6 +3,7 @@
 
 import pandas as pd
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def read_bed_file(filepath, has_score=False):
     """
@@ -16,7 +17,6 @@ def read_bed_file(filepath, has_score=False):
     pd.DataFrame: The BED data.
     """
     if has_score:
-        # Handle reading bed file with scores while addressing potential irregularities.
         with open(filepath, 'r') as file:
             lines = file.readlines()
             data = []
@@ -47,29 +47,9 @@ def calculate_overlap(start1, end1, start2, end2):
     """
     return max(0, min(end1, end2) - max(start1, start2))
 
-def main():
-    # Command-line argument parsing.
-    parser = argparse.ArgumentParser(description='Calculate overlaps between two BED files.')
-    parser.add_argument('-window_bed', required=True, help='Path to the BED file with windows (e.g., windows.bed).')
-    parser.add_argument('-minimap_bed', required=True, help='Path to the BED file with minimap results (e.g., minimap.bed).')
-    parser.add_argument('-output', required=True, help='Path to the output file.')
-    args = parser.parse_args()
-
-    bed1_path = args.window_bed
-    bed2_path = args.minimap_bed
-
-    bed1 = read_bed_file(bed1_path)
-    bed2 = read_bed_file(bed2_path, has_score=True)
-
-    # Debug.
-    # print("Initial bed1 DataFrame:")
-    # print(bed1)
-    # print("\nInitial bed2 DataFrame:")
-    # print(bed2)
-
+def process_chunk(chunk, bed2):
     results = []
-
-    for idx1, row1 in bed1.iterrows():
+    for idx1, row1 in chunk.iterrows():
         chrom1, start1, end1 = row1['chrom'], row1['start'], row1['end']
         output_row = [chrom1, start1, end1]
         
@@ -83,10 +63,7 @@ def main():
                     window_size = end1 - start1
                     overlap_fraction = overlap_size / window_size
                     overlaps.append((overlap_fraction, de_score))
-                    # Debug.
-                    # print(f"Overlap found: {chrom1} {start1}-{end1} with {chrom2} {start2}-{end2} -> Fraction: {overlap_fraction}, de_score: {de_score}")
         
-        # Sort overlaps by start position in minimap_bed for consistent ordering.
         overlaps.sort(key=lambda x: (x[0], x[1]))
         
         for overlap_fraction, de_score in overlaps:
@@ -94,18 +71,34 @@ def main():
             output_row.append(de_score)
         
         results.append(output_row)
+    return results
 
-    # Debug.
-    # print("\nFinal results list:")
-    # for result in results:
-    #     print(result)
-    
-    # Convert results to DataFrame and save.
+def main():
+    # Command-line argument parsing.
+    parser = argparse.ArgumentParser(description='Calculate overlaps between two BED files.')
+    parser.add_argument('-window_bed', required=True, help='Path to the BED file with windows (e.g., windows.bed).')
+    parser.add_argument('-minimap_bed', required=True, help='Path to the BED file with minimap results (e.g., minimap.bed).')
+    parser.add_argument('-output', required=True, help='Path to the output file.')
+    parser.add_argument('--threads', '-t', type=int, default=1, help='Number of threads to use for processing.')
+    args = parser.parse_args()
+
+    bed1_path = args.window_bed
+    bed2_path = args.minimap_bed
+
+    bed1 = read_bed_file(bed1_path)
+    bed2 = read_bed_file(bed2_path, has_score=True)
+
+    chunk_size = len(bed1) // args.threads
+    chunks = [bed1.iloc[i:i + chunk_size] for i in range(0, len(bed1), chunk_size)]
+
+    results = []
+
+    with ProcessPoolExecutor(max_workers=args.threads) as executor:
+        futures = {executor.submit(process_chunk, chunk, bed2): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            results.extend(future.result())
+
     results_df = pd.DataFrame(results)
-    # Debug.
-    # print("\nFinal results DataFrame:")
-    # print(results_df)
-    
     results_df.to_csv(args.output, sep='\t', header=False, index=False)
 
 if __name__ == '__main__':
