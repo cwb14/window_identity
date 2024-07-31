@@ -186,10 +186,9 @@ else
         if [ -f "${weighted_de_tsvs[$i]}" ]; then
             echo "Weighted DE TSV file ${weighted_de_tsvs[$i]} already exists, skipping weighted_de_scores.py..."
         else
-            python "$BIN_DIR/weighted_de_scores.py" -window_bed "$window_bed" -minimap_bed "${output_beds[$i]}" -output "${weighted_de_tsvs[$i]}" &
+            python "$BIN_DIR/weighted_de_scores.py" -window_bed "$window_bed" -minimap_bed "${output_beds[$i]}" -output "${weighted_de_tsvs[$i]}" --threads "$threads"
         fi
     done
-    wait
 
     echo "Step 5: Generate de scores per window"
     for i in "${!queries[@]}"; do
