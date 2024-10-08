@@ -53,13 +53,20 @@ def compute_weighted_average(fai_df, bed_df):
     merged_df = pd.merge(bed_df, fai_df, on='chromosome')
     # Calculate the weight for each alignment.
     merged_df['weight'] = merged_df['aln_len'] / merged_df['chr_size']
-    # Calculate the weighted sequence identiy for each alignment.
+    # Calculate the weighted sequence identity for each alignment.
     merged_df['weighted_seq_ident'] = merged_df['weight'] * merged_df['seq_ident']
 
-    # Calculate weighted average sequence identiy for each chromosome.
-    chrom_weighted_avg = merged_df.groupby('chromosome').apply(
-        lambda x: x['weighted_seq_ident'].sum() / x['weight'].sum()
-    ).reset_index(name='avg_weighted_de')
+    # Calculate weighted average sequence identity for each chromosome using groupby.agg
+    grouped = merged_df.groupby('chromosome').agg(
+        weighted_seq_ident_sum=('weighted_seq_ident', 'sum'),
+        weight_sum=('weight', 'sum')
+    ).reset_index()
+
+    # Compute the average weighted sequence identity
+    grouped['avg_weighted_de'] = grouped['weighted_seq_ident_sum'] / grouped['weight_sum']
+
+    # Select the relevant columns
+    chrom_weighted_avg = grouped[['chromosome', 'avg_weighted_de']]
 
     # Calculate whole genome weighted average sequence identity.
     genome_weighted_avg = merged_df['weighted_seq_ident'].sum() / merged_df['weight'].sum()
@@ -89,3 +96,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# {END}
