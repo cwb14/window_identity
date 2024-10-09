@@ -62,7 +62,7 @@ def process_paf(ref_id, paf_file):
 
     # Write the output files
     for nonid, lines in output_dict.items():
-        output_filename = f"{ref_id}.{nonid}.paf"
+        output_filename = f"{ref_id}.{nonid}.bed"
         with open(output_filename, 'w') as outfile:
             for extracted_line in lines:
                 outfile.write(extracted_line + '\n')
