@@ -373,8 +373,8 @@ REF_ID="${REF_ID%%.*}"
 subset_pafs_exist=true
 for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
-    paf_file="${REF_ID}.${QUERY_ID}.paf"
-    if [[ ! -s "$paf_file" ]]; then
+    bed_file="${REF_ID}.${QUERY_ID}.bed"
+    if [[ ! -s "$bed_file" ]]; then
         subset_pafs_exist=false
         break
     fi
