@@ -193,7 +193,7 @@ while read -r line; do
     ID2=$(echo "$line" | awk '{print $2}')
     anchor_file="${ID1}.${ID2}.anchors"
     expected_anchor_files+=("$anchor_file")
-done <jcvi_list.txt
+done < jcvi_list.txt
 
 anchors_exist=true
 for anchor_file in "${expected_anchor_files[@]}"; do
@@ -209,7 +209,11 @@ if [[ "$anchors_exist" = false ]]; then
     python "$BIN_DIR/jcvi_diploid.py" -p "$PROCESSES" --cpus "$THREADS"
     rm -f *.nsq *.nin *.nhr *.ndb *.nto *.not *.ntf *.njs *.des *.sds *.tis *.ssp *.bck *.suf *.prj
 
-    for i in {1..13}; do
+    # Initialize current processes and threads
+    current_p="$PROCESSES"
+    current_cpus="$THREADS"
+
+    for i in {1..200}; do
         anchors_exist=true
         for anchor_file in "${expected_anchor_files[@]}"; do
             if [[ ! -s "$anchor_file" ]]; then
@@ -217,21 +221,50 @@ if [[ "$anchors_exist" = false ]]; then
                 break
             fi
         done
+
         if [[ "$anchors_exist" = true ]]; then
-            echo "All anchor files exist after $i attempts."
+            echo "All anchor files exist after $i attempt(s)."
             break
         fi
+
         echo "Retrying jcvi_diploid_retry.py - attempt $i"
-        if [[ $i -ge 14 ]]; then
-            python "$BIN_DIR/jcvi_diploid_retry.py" -p 1 --cpus 1
-        else
-            python "$BIN_DIR/jcvi_diploid_retry.py" -p "$PROCESSES" --cpus "$THREADS"
+
+        # Decrement processes and threads, ensuring they don't go below 1
+        if [[ $i -ne 1 ]]; then
+            current_p=$((current_p / 2))
+            current_cpus=$((current_cpus / 2))
+            # Ensure minimum value of 1
+            if [[ $current_p -lt 1 ]]; then
+                current_p=1
+            fi
+            if [[ $current_cpus -lt 1 ]]; then
+                current_cpus=1
+            fi
         fi
+
+        echo "Using -p $current_p --cpus $current_cpus"
+
+        python "$BIN_DIR/jcvi_diploid_retry.py" -p "$current_p" --cpus "$current_cpus"
         rm -f *.nsq *.nin *.nhr *.ndb *.nto *.not *.ntf *.njs *.des *.sds *.tis *.ssp *.bck *.suf *.prj
     done
+
+    # Final check after all attempts
+    anchors_exist=true
+    for anchor_file in "${expected_anchor_files[@]}"; do
+        if [[ ! -s "$anchor_file" ]]; then
+            anchors_exist=false
+            break
+        fi
+    done
+
+    if [[ "$anchors_exist" = false ]]; then
+        echo "Error: Unable to generate all anchor files after multiple attempts."
+        exit 1
+    fi
 else
     echo "Step 5 - Anchor files exist. Skipping."
 fi
+
 
 # Steps 6-8 for each pair in jcvi_list.txt
 while read -r line; do
