@@ -404,11 +404,11 @@ fi
 # Step 14 - Calculate weights for each window in all 'REF.QUERY.paf' files
 for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
-    paf_file="${REF_ID}.${QUERY_ID}.paf"
+    bed_file="${REF_ID}.${QUERY_ID}.bed"
     output_tsv="${REF_ID}.${QUERY_ID}.tsv"
     if [[ ! -s "$output_tsv" ]]; then
-        echo "Calculating weights for $paf_file"
-        python "$BIN_DIR/weighted_de_scores.py" -window_bed "${REF_ID}_mod.window" -minimap_bed "$paf_file" -output "$output_tsv" --threads "$THREADS"
+        echo "Calculating weights for $bed_file"
+        python "$BIN_DIR/weighted_de_scores.py" -window_bed "${REF_ID}_mod.window" -minimap_bed "$bed_file" -output "$output_tsv" --threads "$THREADS"
     else
         echo "Output TSV $output_tsv exists. Skipping."
     fi
@@ -430,11 +430,11 @@ done
 # Step 16 - Generate per-chromosome divergence report
 for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
-    paf_file="${REF_ID}.${QUERY_ID}.paf"
+    bed_file="${REF_ID}.${QUERY_ID}.bed"
     chrom_report="${REF_ID}.${QUERY_ID}.chrom.tsv" # Assuming the script generates output with this name
     if [[ ! -s "$chrom_report" ]]; then
-        echo "Generating per-chromosome divergence report for $paf_file"
-        python "$BIN_DIR/weighted_de_chroms.py" -bed "$paf_file" -fai "${REF_ID}_mod.fa.fai" > "$chrom_report"
+        echo "Generating per-chromosome divergence report for $bed_file"
+        python "$BIN_DIR/weighted_de_chroms.py" -bed "$bed_file" -fai "${REF_ID}_mod.fa.fai" > "$chrom_report"
     else
         echo "Chromosome divergence report $chrom_report exists. Skipping."
     fi
