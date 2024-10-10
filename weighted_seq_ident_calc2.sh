@@ -343,27 +343,11 @@ else
     echo "alignment_genome.tsv exists. Skipping."
 fi
 
-if [[ ! -s "cleaned_matrix.tsv" ]]; then
+if [[ ! -s "ANI_matrix.tsv" ]]; then
     echo "Building the matrix"
-    python "$BIN_DIR/matrix_builder.py" -in alignment_genome.tsv >cleaned_matrix.tsv
+    python "$BIN_DIR/matrix_builder.py" -in alignment_genome.tsv >ANI_matrix.tsv
 else
-    echo "cleaned_matrix.tsv exists. Skipping."
-fi
-
-# Build the tree
-if [[ ! -s "tree.newick" ]]; then
-    echo "Building the tree"
-    upgma_cmd="Rscript $BIN_DIR/upgma.R --method upgma"
-    if [[ -n "$MUTATION_RATE" ]]; then
-        upgma_cmd+=" --mutation_rate $MUTATION_RATE"
-    fi
-    if [[ -n "$NAMES" ]]; then
-        upgma_cmd+=" --name_key $NAMES"
-    fi
-    echo "Running: $upgma_cmd"
-    eval "$upgma_cmd"
-else
-    echo "tree.newick exists. Skipping."
+    echo "ANI_matrix.tsv exists. Skipping."
 fi
 
 # Step 12 - Subset the alignment file according to the reference
@@ -464,3 +448,37 @@ if [[ -n "$YMAX" ]]; then
 fi
 echo "Running: $plot_cmd"
 eval "$plot_cmd"
+
+# Step 19 - Use Kimura's two parameter model (K2P) to estimate genetic distance
+# Determine alignment length (runs every time without skipping)
+echo "Step 19.1 - Calculating alignment lengths"
+bash "$BIN_DIR/aln_match_len.sh" >/dev/null 2>&1
+
+# Convert PAF to variant format for easier viewing of transitions and transversions
+if [[ ! -s "alignment_adjust.vcf" ]]; then
+    echo "Step 19.2 - Converting PAF to variant format"
+    sort -k6,6 -k8,8n alignment_adjust.paf | paftools.js call - | \
+        awk '$1 !~ /R/' | awk '$7 !~ /-/' | awk '$8 !~ /-/' | awk '$5 ~ /1/' > alignment_adjust.vcf
+else
+    echo "Variant file alignment_adjust.vcf exists. Skipping."
+fi
+
+# Build the K2P matrix using the variant file and alignment length files
+if [[ ! -s "cleaned_matrix.tsv" ]]; then
+    echo "Step 19.3 - Building K2P matrix"
+    python "$BIN_DIR/variant_to_k2p_matrix.py" -in alignment_adjust.vcf > cleaned_matrix.tsv
+else
+    echo "K2P matrix cleaned_matrix.tsv exists. Skipping."
+fi
+
+# Build the tree from the cleaned matrix (runs every time without skipping)
+echo "Step 19.4 - Building phylogenetic tree using UPGMA"
+upgma_cmd="Rscript $BIN_DIR/upgma.R --method upgma"
+if [[ -n "$MUTATION_RATE" ]]; then
+    upgma_cmd+=" --mutation_rate $MUTATION_RATE"
+fi
+if [[ -n "$NAMES" ]]; then
+    upgma_cmd+=" --name_key $NAMES"
+fi
+echo "Running: $upgma_cmd"
+eval "$upgma_cmd"
