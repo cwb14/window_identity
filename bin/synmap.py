@@ -52,7 +52,7 @@ def extract_start_pos(file_name):
 
 # Function to run minimap2 alignment and adjust coordinates
 def run_minimap(seq1_file, seq2_file, output_file, kmer, threads):
-    cmd = f"minimap2 -t {threads} --secondary=no -k {kmer} -x asm5 -c {seq1_file} {seq2_file}"
+    cmd = f"minimap2 -t {threads} --secondary=no -k {kmer} --cs=short -x asm5 -c {seq1_file} {seq2_file}"
     print(f"Running minimap2 with command: {cmd}")
     
     # Extract start positions from seq1_file and seq2_file
