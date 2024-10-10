@@ -405,7 +405,7 @@ for genome in "${QUERY_GENOMES[@]}"; do
     avg_tsv="${REF_ID}.${QUERY_ID}.avg.tsv"
     if [[ ! -s "$avg_tsv" ]]; then
         echo "Calculating weighted average for $input_tsv"
-        python "$BIN_DIR/weighted_de_average.py" "$input_tsv" "${REF_ID}_mod.fa" >"$avg_tsv"
+        python "$BIN_DIR/weighted_de_average.py" "$input_tsv" "${QUERY_ID}" >"$avg_tsv"
     else
         echo "Average TSV $avg_tsv exists. Skipping."
     fi
