@@ -316,7 +316,7 @@ cat "${coords_files[@]}" >all.anchors.coords
 # Step 10 - Align the genomic anchors
 if [[ ! -s "alignment.paf" ]]; then
     echo "Step 10 - Align the genomic anchors"
-    python "$BIN_DIR/synmap.py" -t "$THREADS" -p "$PROCESSES" -c all.anchors.coords >/dev/null 2>&1
+    python "$BIN_DIR/synmap.py" --timer 8h -t "$THREADS" -p "$PROCESSES" -c all.anchors.coords >/dev/null 2>&1 # I could add timer as a command line parameter. 
 else
     echo "Step 10 - alignment.paf exists. Skipping."
 fi
@@ -450,13 +450,15 @@ echo "Running: $plot_cmd"
 eval "$plot_cmd"
 
 # Step 19 - Use Kimura's two parameter model (K2P) to estimate genetic distance
-# Determine alignment length (runs every time without skipping)
+# Determine alignment length.
+# K2P needs to know alignment length. This script checks query aln length and also ref aln length, and selects the sorter of the two.
 echo "Step 19.1 - Calculating alignment lengths"
 bash "$BIN_DIR/aln_match_len.sh" >/dev/null 2>&1
 
 # Convert PAF to variant format for easier viewing of transitions and transversions
 if [[ ! -s "alignment_adjust.vcf" ]]; then
     echo "Step 19.2 - Converting PAF to variant format"
+    # 'R' gives regions covered by one query contig, '-' are indels so not relevant for k2p, Heng Li says 'you should only look at variants where column 5 is one'.
     sort -k6,6 -k8,8n alignment_adjust.paf | paftools.js call - | \
         awk '$1 !~ /R/' | awk '$7 !~ /-/' | awk '$8 !~ /-/' | awk '$5 ~ /1/' > alignment_adjust.vcf
 else
@@ -471,7 +473,7 @@ else
     echo "K2P matrix cleaned_matrix.tsv exists. Skipping."
 fi
 
-# Build the tree from the cleaned matrix (runs every time without skipping)
+# Build the tree from the cleaned matrix.
 echo "Step 19.4 - Building phylogenetic tree using UPGMA"
 upgma_cmd="Rscript $BIN_DIR/upgma.R --method upgma"
 if [[ -n "$MUTATION_RATE" ]]; then
