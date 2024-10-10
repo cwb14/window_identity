@@ -50,8 +50,25 @@ def extract_start_pos(file_name):
     start = int(parts[-2])
     return start
 
+def convert_timer_to_seconds(timer_str):
+    if not timer_str:
+        return None
+    unit = timer_str[-1]
+    value = int(timer_str[:-1])
+    
+    if unit == 'd':
+        return value * 86400  # 1 day = 86400 seconds
+    elif unit == 'h':
+        return value * 3600   # 1 hour = 3600 seconds
+    elif unit == 'm':
+        return value * 60     # 1 minute = 60 seconds
+    elif unit == 's':
+        return value          # seconds
+    else:
+        raise ValueError(f"Invalid time unit in '{timer_str}'. Use 'd', 'h', 'm', or 's'.")
+
 # Function to run minimap2 alignment and adjust coordinates
-def run_minimap(seq1_file, seq2_file, output_file, kmer, threads):
+def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
     cmd = f"minimap2 -t {threads} --secondary=no -k {kmer} --cs=short -x asm5 -c {seq1_file} {seq2_file}"
     print(f"Running minimap2 with command: {cmd}")
     
@@ -59,41 +76,42 @@ def run_minimap(seq1_file, seq2_file, output_file, kmer, threads):
     start1 = extract_start_pos(seq1_file)
     start2 = extract_start_pos(seq2_file)
     
-    # Run minimap2 and capture the output
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    try:
+        # Run minimap2 and apply the timer if specified
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timer)
+        
+        if result.returncode != 0:
+            print(f"Error running minimap2: {result.stderr}")
+            return
+        
+        # Process the output line by line
+        adjusted_lines = []
+        for line in result.stdout.strip().split('\n'):
+            if line.strip() == '':
+                continue
+            cols = line.strip().split('\t')
+            if len(cols) < 12:
+                print(f"Invalid PAF line: {line}")
+                continue
+            cols[2] = str(int(cols[2]) + start1)
+            cols[3] = str(int(cols[3]) + start1)
+            cols[7] = str(int(cols[7]) + start2)
+            cols[8] = str(int(cols[8]) + start2)
+            adjusted_line = '\t'.join(cols)
+            adjusted_lines.append(adjusted_line)
+        
+        # Write adjusted lines to output_file
+        with open(output_file, 'a') as f:
+            for line in adjusted_lines:
+                f.write(line + '\n')
     
-    if result.returncode != 0:
-        print(f"Error running minimap2: {result.stderr}")
-        return
-    
-    # Process the output line by line
-    adjusted_lines = []
-    for line in result.stdout.strip().split('\n'):
-        if line.strip() == '':
-            continue
-        cols = line.strip().split('\t')
-        # PAF format has at least 12 columns
-        if len(cols) < 12:
-            print(f"Invalid PAF line: {line}")
-            continue
-        # Adjust columns 3 and 4 (0-based)
-        cols[2] = str(int(cols[2]) + start1)
-        cols[3] = str(int(cols[3]) + start1)
-        # Adjust columns 8 and 9 (0-based)
-        cols[7] = str(int(cols[7]) + start2)
-        cols[8] = str(int(cols[8]) + start2)
-        # Reconstruct the line
-        adjusted_line = '\t'.join(cols)
-        adjusted_lines.append(adjusted_line)
-    
-    # Write adjusted lines to output_file
-    with open(output_file, 'a') as f:
-        for line in adjusted_lines:
-            f.write(line + '\n')
+    except subprocess.TimeoutExpired:
+        print(f"Process took longer than {timer} seconds. Skipping this alignment.")
+        # No need to write anything if the process timed out.
 
 # Function to process each line of coords
 def process_line(args):
-    line, genome_dir, temp_dir_base, kmer, threads, output_file, debug_mode = args
+    line, genome_dir, temp_dir_base, kmer, threads, output_file, debug_mode, timer = args
     syncoord1, syncoord2, strand = line.strip().split("\t")
     
     print(f"Processing line: {line.strip()}")
@@ -130,7 +148,7 @@ def process_line(args):
     print(f"Wrote temp sequence files: {seq1_file}, {seq2_file}")
 
     # Run minimap2 alignment and adjust coordinates
-    run_minimap(seq1_file, seq2_file, output_file, kmer, threads)
+    run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer)
 
     # Clean up temp files and temp directory if not in debug mode
     if not debug_mode:
@@ -151,7 +169,7 @@ def main():
     parser.add_argument("-p", "--processes", type=int, default=10, help="Number of parallel processes.")
     parser.add_argument("-c", "--coords", required=True, help="Input file containing syntenic coordinates.")
     parser.add_argument("-d", "--debug", action="store_true", help="Debug mode: retain temp files.")
-
+    parser.add_argument("--timer", type=str, help="Set a timer for each minimap2 process. Format: [int][d/h/m/s], e.g., '2m' for 2 minutes.")
     args = parser.parse_args()
 
     # Check mutual exclusivity between pairedIDs and singleID
@@ -192,7 +210,8 @@ def main():
     os.makedirs(temp_dir_base, exist_ok=True)
 
     # Process lines with multiprocessing
-    args_list = [(line, ".", temp_dir_base, args.kmer, args.threads, output_file, args.debug) for line in filtered_lines]
+    timer_seconds = convert_timer_to_seconds(args.timer)
+    args_list = [(line, ".", temp_dir_base, args.kmer, args.threads, output_file, args.debug, timer_seconds) for line in filtered_lines]
     print(f"Processing {len(args_list)} lines with {args.processes} processes")
     with Pool(processes=args.processes) as pool:
         pool.map(process_line, args_list)
