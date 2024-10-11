@@ -69,7 +69,7 @@ def convert_timer_to_seconds(timer_str):
 
 # Function to run minimap2 alignment and adjust coordinates
 def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
-    cmd = f"minimap2 -t {threads} --secondary=no -k {kmer} --cs=short -x asm5 -c {seq1_file} {seq2_file}"
+    cmd = f"minimap2 -t {threads} --secondary=no -k {kmer} --cs=short -x asm10 -c {seq1_file} {seq2_file}"
     print(f"Running minimap2 with command: {cmd}")
     
     # Extract start positions from seq1_file and seq2_file
