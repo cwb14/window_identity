@@ -53,12 +53,13 @@ def main():
             if not line or line.startswith('#'):
                 continue
             fields = line.split('\t')
-            if len(fields) < 9:
+            # print(fields)  # Debug: Print parsed fields
+            if len(fields) < 8:
                 continue
-            REF_ID = fields[1]
-            REF_SEQ = fields[6]
-            QUERY_SEQ = fields[7]
-            QUERY_ID = fields[8]
+            REF_ID = fields[0]  # First column is the reference contig
+            REF_SEQ = fields[3]  # 4th column is the reference allele
+            QUERY_SEQ = fields[4]  # 5th column is the query allele
+            QUERY_ID = fields[5]  # 6th column is the query contig
 
             REF_GENOME = REF_ID.split('_')[0]
             QUERY_GENOME = QUERY_ID.split('_')[0]
@@ -66,6 +67,8 @@ def main():
             genomes.update([REF_GENOME, QUERY_GENOME])
 
             result = is_transition(REF_SEQ, QUERY_SEQ)
+            # print(f"Result: {result}, REF_GENOME: {REF_GENOME}, QUERY_GENOME: {QUERY_GENOME}")  # Debug: Show transition/transversion
+
             if result == 'transition':
                 genome_pair = tuple(sorted([REF_GENOME, QUERY_GENOME]))
                 counts[genome_pair]['Ti'] += 1
@@ -73,6 +76,8 @@ def main():
                 genome_pair = tuple(sorted([REF_GENOME, QUERY_GENOME]))
                 counts[genome_pair]['Tv'] += 1
             # else: ignore non-variant or invalid bases
+
+    # print(f"Counts: {counts}")  # Debug: Show counts of transitions and transversions
 
     # Read length files
     total_lengths = {}
@@ -93,6 +98,8 @@ def main():
                     sys.stderr.write(f"Warning: Invalid length in file {filename}\n")
         else:
             sys.stderr.write(f"Warning: Unrecognized filename format: {filename}\n")
+
+    # print(f"Total lengths: {total_lengths}")  # Debug: Print total lengths
 
     genome_list = sorted(genomes)
     distance_matrix = defaultdict(dict)
@@ -118,6 +125,8 @@ def main():
                 except ValueError as e:
                     sys.stderr.write(f"Error computing K2P distance for genomes {genome_pair}: {e}\n")
                     distance_matrix[i][j] = 'NA'
+
+    # print(f"Distance Matrix: {distance_matrix}")  # Debug: Print distance matrix before output
 
     # Output the distance matrix
     print('\t' + '\t'.join(genome_list))
