@@ -459,8 +459,10 @@ bash "$BIN_DIR/aln_match_len.sh" >/dev/null 2>&1
 if [[ ! -s "alignment_adjust.vcf" ]]; then
     echo "Step 19.2 - Converting PAF to variant format"
     # 'R' gives regions covered by one query contig, '-' are indels so not relevant for k2p, Heng Li says 'you should only look at variants where column 5 is one'.
-    sort -k6,6 -k8,8n alignment_adjust.paf | paftools.js call - | \
-        awk '$1 !~ /R/' | awk '$7 !~ /-/' | awk '$8 !~ /-/' | awk '$5 ~ /1/' > alignment_adjust.vcf
+    # sort -k6,6 -k8,8n alignment_adjust.paf | paftools.js call - | \
+    #   awk '$1 !~ /R/' | awk '$7 !~ /-/' | awk '$8 !~ /-/' | awk '$5 ~ /1/' > alignment_adjust.vcf # I dont think 'paftools.js call' is built for genome-to-genome alignments. More genetic distance gives fewer variants. I guess theyre filtered out. 
+    # 'paf_to_variant.py' uses the cs tag to convert all mismatch (substitutions) to a variant format.
+    python "$BIN_DIR/paf_to_variant.py" -paf alignment_adjust.paf | sort | uniq > alignment_adjust.vcf
 else
     echo "Variant file alignment_adjust.vcf exists. Skipping."
 fi
