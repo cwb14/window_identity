@@ -93,10 +93,10 @@ def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
             if len(cols) < 12:
                 print(f"Invalid PAF line: {line}")
                 continue
-            cols[2] = str(int(cols[2]) + start1)
-            cols[3] = str(int(cols[3]) + start1)
-            cols[7] = str(int(cols[7]) + start2)
-            cols[8] = str(int(cols[8]) + start2)
+            cols[2] = str(int(cols[2]) + start2)  # Add target (seq2) start position to column 3
+            cols[3] = str(int(cols[3]) + start2)  # Add target (seq2) start position to column 4
+            cols[7] = str(int(cols[7]) + start1)  # Add query (seq1) start position to column 8
+            cols[8] = str(int(cols[8]) + start1)  # Add query (seq1) start position to column 9
             adjusted_line = '\t'.join(cols)
             adjusted_lines.append(adjusted_line)
         
