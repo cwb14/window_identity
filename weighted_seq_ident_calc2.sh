@@ -324,28 +324,32 @@ fi
 # Step 11 - Adjust the PAF coordinates, calculate the weighted divergence, and build the tree
 if [[ ! -s "alignment_adjust.paf" ]]; then
     echo "Adjusting alignment.paf to alignment_adjust.paf"
-    python "$BIN_DIR/synmap_adjust.py" -paf alignment.paf >alignment_adjust.paf
+    python "$BIN_DIR/synmap_adjust.py" -paf alignment.paf | \
+    awk '{for(i=1;i<=NF;i++) if($i ~ /^cg:Z:/){c=substr($i,6);s=0; while(match(c,/([0-9]+)M/,a)){s+=a[1];c=substr(c,RSTART+RLENGTH)}; print $0 "\t" s}}' | \
+    python "$BIN_DIR/calculate_k2p.py" | sed 's/-0.000000/0.000000/g' > alignment_adjust.paf
 else
     echo "alignment_adjust.paf exists. Skipping."
 fi
 
 if [[ ! -s "alignment_adjust.tsv" ]]; then
     echo "Calculating weighted divergence"
-    python "$BIN_DIR/weighted_paf.py" -paf alignment_adjust.paf >alignment_adjust.tsv
+    python "$BIN_DIR/weighted_paf.py" -paf alignment_adjust.paf
 else
     echo "alignment_adjust.tsv exists. Skipping."
 fi
 
 if [[ ! -s "alignment_genome.tsv" ]]; then
     echo "Calculating weighted averages"
-    python "$BIN_DIR/weighted_average3.py" -input alignment_adjust.tsv -chrom_out alignment_chrom.tsv -genome_out alignment_genome.tsv
+    python "$BIN_DIR/weighted_average3.py" -input alignment_de.tsv -chrom_out de_chrom.tsv -genome_out de_genome.tsv
+    python "$BIN_DIR/weighted_average3.py" -input alignment_k2p.tsv -chrom_out k2p_chrom.tsv -genome_out k2p_genome.tsv
 else
     echo "alignment_genome.tsv exists. Skipping."
 fi
 
 if [[ ! -s "ANI_matrix.tsv" ]]; then
     echo "Building the matrix"
-    python "$BIN_DIR/matrix_builder.py" -in alignment_genome.tsv >ANI_matrix.tsv
+    python "$BIN_DIR/matrix_builder.py" -in de_genome.tsv > de_matrix.tsv
+    python "$BIN_DIR/matrix_builder.py" -in k2p_genome.tsv > k2p_matrix.tsv
 else
     echo "ANI_matrix.tsv exists. Skipping."
 fi
@@ -449,34 +453,8 @@ fi
 echo "Running: $plot_cmd"
 eval "$plot_cmd"
 
-# Step 19 - Use Kimura's two parameter model (K2P) to estimate genetic distance
-# Determine alignment length.
-# K2P needs to know alignment length. This script checks query aln length and also ref aln length, and selects the sorter of the two.
-echo "Step 19.1 - Calculating alignment lengths"
-bash "$BIN_DIR/aln_match_len.sh" >/dev/null 2>&1
-
-# Convert PAF to variant format for easier viewing of transitions and transversions
-if [[ ! -s "alignment_adjust.vcf" ]]; then
-    echo "Step 19.2 - Converting PAF to variant format"
-    # 'R' gives regions covered by one query contig, '-' are indels so not relevant for k2p, Heng Li says 'you should only look at variants where column 5 is one'.
-    # sort -k6,6 -k8,8n alignment_adjust.paf | paftools.js call - | \
-    #   awk '$1 !~ /R/' | awk '$7 !~ /-/' | awk '$8 !~ /-/' | awk '$5 ~ /1/' > alignment_adjust.vcf # I dont think 'paftools.js call' is built for genome-to-genome alignments. More genetic distance gives fewer variants. I guess theyre filtered out. 
-    # 'paf_to_variant.py' uses the cs tag to convert all mismatch (substitutions) to a variant format.
-    python "$BIN_DIR/paf_to_variant.py" -paf alignment_adjust.paf | sort | uniq > alignment_adjust.vcf
-else
-    echo "Variant file alignment_adjust.vcf exists. Skipping."
-fi
-
-# Build the K2P matrix using the variant file and alignment length files
-if [[ ! -s "cleaned_matrix.tsv" ]]; then
-    echo "Step 19.3 - Building K2P matrix"
-    python "$BIN_DIR/variant_to_k2p_matrix.py" -in alignment_adjust.vcf > cleaned_matrix.tsv
-else
-    echo "K2P matrix cleaned_matrix.tsv exists. Skipping."
-fi
-
 # Build the tree from the cleaned matrix.
-echo "Step 19.4 - Building phylogenetic tree using UPGMA"
+echo "Step 19 - Building phylogenetic tree using UPGMA"
 upgma_cmd="Rscript $BIN_DIR/upgma.R --method upgma"
 if [[ -n "$MUTATION_RATE" ]]; then
     upgma_cmd+=" --mutation_rate $MUTATION_RATE"

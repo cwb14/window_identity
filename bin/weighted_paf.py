@@ -4,7 +4,7 @@ import argparse
 import sys
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Calculate divergence weights from PAF alignments.")
+    parser = argparse.ArgumentParser(description="Calculate divergence and K2P weights from PAF alignments.")
     parser.add_argument('-paf', required=True, help='Input PAF file')
     return parser.parse_args()
 
@@ -13,7 +13,7 @@ def process_paf_line(fields):
     Process a single PAF line and return the required output fields if applicable.
     
     Returns:
-        tuple: (query_name, target_name, divergence_weight, divergence) or None
+        tuple: (query_name, target_name, divergence_weight, divergence, k2p) or None
     """
     if len(fields) < 21:
         # Not enough columns
@@ -67,14 +67,19 @@ def process_paf_line(fields):
     
     # Get divergence from column21 (0-based index 20)
     divergence = fields[20]
+    # Get K2P from the rightmost field
+    k2p = fields[-1]
     
-    return (query_name, target_name, divergence_weight, divergence)
+    return (query_name, target_name, divergence_weight, divergence, k2p)
 
 def main():
     args = parse_arguments()
     
     try:
-        with open(args.paf, 'r') as paf_file:
+        with open(args.paf, 'r') as paf_file, \
+             open("alignment_de.tsv", 'w') as divergence_file, \
+             open("alignment_k2p.tsv", 'w') as k2p_file:
+            
             for line in paf_file:
                 line = line.strip()
                 if not line or line.startswith('#'):
@@ -82,10 +87,16 @@ def main():
                 fields = line.split('\t')
                 result = process_paf_line(fields)
                 if result:
-                    query_name, target_name, divergence_weight, divergence = result
+                    query_name, target_name, divergence_weight, divergence, k2p = result
                     # Format divergence_weight to 5 decimal places
                     divergence_weight_str = f"{divergence_weight:.5f}"
-                    print(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{divergence}")
+                    
+                    # Write to alignment_divergence.tsv
+                    divergence_file.write(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{divergence}\n")
+                    
+                    # Write to alignment_k2p.tsv
+                    k2p_file.write(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{k2p}\n")
+    
     except FileNotFoundError:
         sys.stderr.write(f"Error: File '{args.paf}' not found.\n")
         sys.exit(1)
@@ -95,3 +106,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# END
