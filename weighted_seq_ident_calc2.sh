@@ -316,7 +316,9 @@ cat "${coords_files[@]}" >all.anchors.coords
 # Step 10 - Align the genomic anchors
 if [[ ! -s "alignment.paf" ]]; then
     echo "Step 10 - Align the genomic anchors"
-    python "$BIN_DIR/synmap.py" --timer 8h -t "$THREADS" -p "$PROCESSES" -c all.anchors.coords >/dev/null 2>&1 # I could add timer as a command line parameter. 
+    python "$BIN_DIR/synmap.py" --timer 8h -t "$THREADS" -p "$PROCESSES" -c all.anchors.coords >/dev/null 2>&1 # I could add timer as a command line parameter.
+    # I can use 'paftools.js view' to visualize aln quality and optimize parameters.
+    # The minimap2 parameters likely need optimized since k2p seems off.
 else
     echo "Step 10 - alignment.paf exists. Skipping."
 fi
@@ -327,6 +329,7 @@ if [[ ! -s "alignment_adjust.paf" ]]; then
     python "$BIN_DIR/synmap_adjust.py" -paf alignment.paf | \
     awk '{for(i=1;i<=NF;i++) if($i ~ /^cg:Z:/){c=substr($i,6);s=0; while(match(c,/([0-9]+)M/,a)){s+=a[1];c=substr(c,RSTART+RLENGTH)}; print $0 "\t" s}}' | \
     python "$BIN_DIR/calculate_k2p.py" | sed 's/-0.000000/0.000000/g' > alignment_adjust.paf
+    # 'calculate_k2p.py' includes '-d' and '-r' flags that may help filter low confidence variants and improve k2p.
 else
     echo "alignment_adjust.paf exists. Skipping."
 fi
