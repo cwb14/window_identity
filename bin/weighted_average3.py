@@ -13,12 +13,20 @@ def parse_arguments():
 
 def extract_divergence(divergence_field):
     """
-    Extracts the numeric divergence value from a string formatted as 'de:f:<value>'.
+    Extracts the numeric divergence value from a string.
+    Supports both 'de:f:<value>' and plain numeric values.
     """
-    try:
-        return float(divergence_field.split(':')[-1])
-    except (IndexError, ValueError):
-        raise ValueError(f"Invalid divergence format: '{divergence_field}'")
+    if divergence_field.startswith('de:f:'):
+        try:
+            return float(divergence_field.split(':')[-1])
+        except (IndexError, ValueError):
+            raise ValueError(f"Invalid divergence format: '{divergence_field}'")
+    else:
+        try:
+            return float(divergence_field)
+        except ValueError:
+            raise ValueError(f"Invalid divergence format: '{divergence_field}'")
+
 
 def process_file(input_file):
     """
