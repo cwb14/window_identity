@@ -11,56 +11,67 @@ def parse_arguments():
 def process_paf_line(fields):
     """
     Process a single PAF line and return the required output fields if applicable.
-    
+
     Returns:
-        tuple: (query_name, target_name, divergence_weight, divergence, k2p) or None
+        dict or None: {
+            'query_name': str,
+            'target_name': str,
+            'query_accession_name': str,
+            'target_accession_name': str,
+            'line_match_and_mismatch': float,
+            'divergence': str,
+            'k2p': str
+        }
     """
-    if len(fields) < 21:
-        # Not enough columns
+    if len(fields) < 12:
         return None
-    
+
     query_name = fields[0]
+    target_name = fields[5]
+
+    query_accession_name = query_name.split('_')[0]
+    target_accession_name = target_name.split('_')[0]
+
     try:
-        query_start = int(fields[2])
-        query_end = int(fields[3])
-        target_name = fields[5]
-        target_start = int(fields[7])
-        target_end = int(fields[8])
-        
-        # Get the query and target genome lengths from the fourth and third columns from the right, respectively
-        query_genome_length = int(fields[-4])
-        target_genome_length = int(fields[-3])
+        line_match_and_mismatch = float(fields[-2])
     except ValueError:
-        # Invalid integer conversion
         return None
-    
-    # Calculate average_alignment_length
-    alignment_length_query = query_end - query_start
-    alignment_length_target = target_end - target_start
-    average_alignment_length = (alignment_length_query + alignment_length_target) / 2
-    
-    # Calculate avg_genome_length using query_genome_length and target_genome_length
-    avg_genome_length = (query_genome_length + target_genome_length) / 2
-    
-    # Calculate divergence_weight
-    divergence_weight = average_alignment_length / avg_genome_length
-    
-    # Get divergence from column 21 (0-based index 20)
-    divergence = fields[20]
-    
+
+    # Get divergence from optional fields
+    divergence = None
+    for field in fields[12:-4]:  # Optional fields excluding the last four numeric fields
+        if field.startswith('de:f:'):
+            # Handle possible concatenation without tab
+            if 'rl:i:' in field:
+                divergence_value = field.split('de:f:')[1].split('rl:i:')[0]
+                divergence = divergence_value.strip()
+            else:
+                divergence = field.split('de:f:')[1]
+            break
+    if divergence is None:
+        divergence = '0'  # Default value if not found
+
     # Get K2P from the rightmost field
     k2p = fields[-1]
-    
-    return (query_name, target_name, divergence_weight, divergence, k2p)
+
+    return {
+        'query_name': query_name,
+        'target_name': target_name,
+        'query_accession_name': query_accession_name,
+        'target_accession_name': target_accession_name,
+        'line_match_and_mismatch': line_match_and_mismatch,
+        'divergence': divergence,
+        'k2p': k2p
+    }
 
 def main():
     args = parse_arguments()
-    
+
     try:
-        with open(args.paf, 'r') as paf_file, \
-             open("alignment_de.tsv", 'w') as divergence_file, \
-             open("alignment_k2p.tsv", 'w') as k2p_file:
-            
+        with open(args.paf, 'r') as paf_file:
+            lines = []
+            total_match_and_mismatch_dict = {}
+
             for line in paf_file:
                 line = line.strip()
                 if not line or line.startswith('#'):
@@ -68,16 +79,32 @@ def main():
                 fields = line.split('\t')
                 result = process_paf_line(fields)
                 if result:
-                    query_name, target_name, divergence_weight, divergence, k2p = result
-                    # Format divergence_weight to 12 decimal places
-                    divergence_weight_str = f"{divergence_weight:.12f}"
-                    
-                    # Write to alignment_de.tsv
-                    divergence_file.write(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{divergence}\n")
-                    
-                    # Write to alignment_k2p.tsv
-                    k2p_file.write(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{k2p}\n")
-    
+                    lines.append(result)
+                    pair = tuple(sorted([result['query_accession_name'], result['target_accession_name']]))
+                    total_match_and_mismatch = total_match_and_mismatch_dict.get(pair, 0)
+                    total_match_and_mismatch += result['line_match_and_mismatch']
+                    total_match_and_mismatch_dict[pair] = total_match_and_mismatch
+
+        # Now process each line and write outputs
+        with open("alignment_de.tsv", 'w') as divergence_file, \
+             open("alignment_k2p.tsv", 'w') as k2p_file:
+
+            for result in lines:
+                pair = tuple(sorted([result['query_accession_name'], result['target_accession_name']]))
+                total_match_and_mismatch = total_match_and_mismatch_dict[pair]
+                divergence_weight = result['line_match_and_mismatch'] / total_match_and_mismatch
+                divergence_weight_str = f"{divergence_weight:.12f}"
+                query_name = result['query_name']
+                target_name = result['target_name']
+                divergence = result['divergence']
+                k2p = result['k2p']
+
+                # Write to alignment_de.tsv
+                divergence_file.write(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{divergence}\n")
+
+                # Write to alignment_k2p.tsv
+                k2p_file.write(f"{query_name}\t{target_name}\t{divergence_weight_str}\t{k2p}\n")
+
     except FileNotFoundError:
         sys.stderr.write(f"Error: File '{args.paf}' not found.\n")
         sys.exit(1)
