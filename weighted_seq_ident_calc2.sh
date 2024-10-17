@@ -330,6 +330,7 @@ if [[ ! -s "alignment_adjust.paf" ]]; then
     awk '{for(i=1;i<=NF;i++) if($i ~ /^cg:Z:/){c=substr($i,6);s=0; while(match(c,/([0-9]+)M/,a)){s+=a[1];c=substr(c,RSTART+RLENGTH)}; print $0 "\t" s}}' | \
     python "$BIN_DIR/calculate_k2p.py" | sed 's/-0.000000/0.000000/g' > alignment_adjust.paf
     # 'calculate_k2p.py' includes '-d' and '-r' flags that may help filter low confidence variants and improve k2p.
+    # The four added columns on the rightmost end are (query_genome_length, target_genome_length, number_matches_and_mismatches, and k2p).
 else
     echo "alignment_adjust.paf exists. Skipping."
 fi
