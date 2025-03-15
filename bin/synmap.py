@@ -3,13 +3,17 @@
 import os
 import sys
 import argparse
+import shutil
+import subprocess
+import re
+import tempfile  # Import tempfile for creating unique temp directories
 from multiprocessing import Pool
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
-import subprocess
-import re
-import tempfile  # Import tempfile for creating unique temp directories
+
+# Global variable for the minimap2 binary path
+MINIMAP2_BIN = None
 
 # Function to parse syncoord and extract sequences
 def extract_sequence(fasta_file, syncoord, reverse_complement=False):
@@ -69,7 +73,8 @@ def convert_timer_to_seconds(timer_str):
 
 # Function to run minimap2 alignment and adjust coordinates
 def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
-    cmd = f"minimap2 -t {threads} --secondary=no -k {kmer} --cs=short -x asm10 -c {seq1_file} {seq2_file}"
+    # Use the downloaded minimap2 binary
+    cmd = f"{MINIMAP2_BIN} -t {threads} --secondary=no -k {kmer} --cs=short -x asm10 -c {seq1_file} {seq2_file}"
     print(f"Running minimap2 with command: {cmd}")
     
     # Extract start positions from seq1_file and seq2_file
@@ -180,6 +185,17 @@ def main():
     output_file = "alignment.paf"
     print(f"Output file: {output_file}")
 
+    # Download the latest minimap2 release into a temporary directory.
+    # My conda version is out of date. 
+    # This will need updated as newer minimap2 updates are released. 
+    temp_minimap_dir = tempfile.mkdtemp(prefix="minimap2_download_")
+    download_cmd = f"curl -L https://github.com/lh3/minimap2/releases/download/v2.28/minimap2-2.28_x64-linux.tar.bz2 | tar -jxvf - -C {temp_minimap_dir}"
+    print(f"Downloading minimap2 using command: {download_cmd}")
+    subprocess.run(download_cmd, shell=True, check=True)
+    global MINIMAP2_BIN
+    MINIMAP2_BIN = os.path.join(temp_minimap_dir, "minimap2-2.28_x64-linux", "minimap2")
+    print(f"Using minimap2 binary at: {MINIMAP2_BIN}")
+
     # Load coords
     with open(args.coords, "r") as f:
         lines = f.readlines()
@@ -205,7 +221,7 @@ def main():
 
     print(f"Filtered down to {len(filtered_lines)} lines based on accessions of interest")
 
-    # Prepare temp directory base
+    # Prepare temp directory base for per-alignment temporary files
     temp_dir_base = "./minimap_temp"
     os.makedirs(temp_dir_base, exist_ok=True)
 
@@ -223,6 +239,10 @@ def main():
             os.rmdir(temp_dir_base)
         except OSError:
             print(f"Could not remove {temp_dir_base}, it may not be empty.")
+
+    # Delete the downloaded minimap2 directory
+    print(f"Removing downloaded minimap2 directory: {temp_minimap_dir}")
+    shutil.rmtree(temp_minimap_dir)
 
 if __name__ == "__main__":
     main()
