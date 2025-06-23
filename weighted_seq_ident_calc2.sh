@@ -16,20 +16,47 @@ YMAX=""
 NAMES=""
 REF=""
 QUERY_GENOMES=()
+# Divergence mapping option for synmap.py
+X_TYPE="asm10"
+
+# Help menu function
+usage() {
+    cat << EOF
+Usage: $(basename "$0") -ref REF_GENOME -query GENOME1 [GENOME2 ...] [options]
+
+Required:
+  -ref GENOME                  Reference genome
+  -query GENOME [GENOME ...]   Query genome(s)
+
+Options:
+  -window_size SIZE            Window size (default: $WINDOW_SIZE)
+  -slide_size SIZE             Slide size (default: $SLIDE_SIZE)
+  -peptide FILE                Protein file (default: $PROTEIN)
+  -threads N                   Number of threads (default: $THREADS)
+  -processes N                 Number of processes (default: $PROCESSES)
+  -mutation_rate RATE          Mutation rate (default: $MUTATION_RATE)
+  -names STRING                Names key file
+  -include_mean_line yes|no    Include mean line in plot (default: $INCLUDE_MEAN_LINE)
+  -ymax YMAX                   Y-axis maximum for plot
+  -x asm5|asm10|asm20          Sequence divergence mapping for synmap.py (default: $X_TYPE)
+  -h, --help                   Show this help message and exit
+EOF
+}
 
 # Parsing command-line arguments
-POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     key="$1"
-
     case $key in
+    -h|--help)
+        usage
+        exit 0
+        ;;
     -ref)
         REF="$2"
-        shift # past argument
-        shift # past value
+        shift; shift
         ;;
     -query)
-        shift # past argument
+        shift
         while [[ $# -gt 0 && ! "$1" =~ ^- ]]; do
             QUERY_GENOMES+=("$1")
             shift
@@ -37,51 +64,47 @@ while [[ $# -gt 0 ]]; do
         ;;
     -window_size)
         WINDOW_SIZE="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -slide_size)
         SLIDE_SIZE="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -peptide)
         PROTEIN="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -threads)
         THREADS="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -processes)
         PROCESSES="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -mutation_rate)
         MUTATION_RATE="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -names)
         NAMES="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -include_mean_line)
         INCLUDE_MEAN_LINE="$2"
-        shift
-        shift
+        shift; shift
         ;;
     -ymax)
         YMAX="$2"
-        shift
-        shift
+        shift; shift
+        ;;
+    -x)
+        X_TYPE="$2"
+        shift; shift
         ;;
     *)
-        echo "Unknown option $1"
+        echo "Error: Unknown option $1"
+        usage
         exit 1
         ;;
     esac
@@ -90,11 +113,13 @@ done
 # Check for required arguments
 if [[ -z "$REF" ]]; then
     echo "Error: Reference genome (-ref) is required."
+    usage
     exit 1
 fi
 
-if [[ ${#QUERY_GENOMES[@]} -eq 0 ]]; then
+if [[ \${#QUERY_GENOMES[@]} -eq 0 ]]; then
     echo "Error: At least one query genome (-query) is required."
+    usage
     exit 1
 fi
 
@@ -108,6 +133,7 @@ for genome in "${ALL_GENOMES[@]}"; do
     id="${filename%%.*}"
     GENOME_IDS["$genome"]="$id"
 done
+
 
 # Step 1 - Cleanup the input genome file
 modified_fastas_exist=true
@@ -316,7 +342,7 @@ cat "${coords_files[@]}" >all.anchors.coords
 # Step 10 - Align the genomic anchors
 if [[ ! -s "alignment.paf" ]]; then
     echo "Step 10 - Align the genomic anchors"
-    python "$BIN_DIR/synmap.py" --timer 8h -t "$THREADS" -p "$PROCESSES" -c all.anchors.coords >/dev/null 2>&1 # I could add timer as a command line parameter.
+    python "$BIN_DIR/synmap.py" --timer 8h -t "$THREADS" -p "$PROCESSES" --preset "$X_TYPE" -c all.anchors.coords 
     # I can use 'paftools.js view' to visualize aln quality and optimize parameters.
     # The minimap2 parameters likely need optimized since k2p seems off.
 else
