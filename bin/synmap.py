@@ -5,243 +5,243 @@ import sys
 import argparse
 import shutil
 import subprocess
-import re
-import tempfile  # Import tempfile for creating unique temp directories
-from multiprocessing import Pool
+import tempfile
+import threading
+import time
+from multiprocessing import Pool, Manager
 from Bio import SeqIO
-from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
-# Global variable for the minimap2 binary path
+# Global variables
 MINIMAP2_BIN = None
+PRESET = "asm10"
+VERBOSE = False
+
+# Logging helper
+def log(msg):
+    if VERBOSE:
+        print(msg)
 
 # Function to parse syncoord and extract sequences
 def extract_sequence(fasta_file, syncoord, reverse_complement=False):
     try:
-        # Split the syncoord into accessionID_seqID and start..end
         accession_seqid, pos_range = syncoord.split(":")
         start, end = map(int, pos_range.split(".."))
-        
         accession_id, seqid = accession_seqid.split("_")
-        
-        print(f"Parsed syncoord: accession_id={accession_id}, seqid={seqid}, start={start}, end={end}")
-
+        log(f"Parsed syncoord: accession_id={accession_id}, seqid={seqid}, start={start}, end={end}")
     except ValueError as e:
-        print(f"Error parsing syncoord: {syncoord}. Expected format 'accessionID_seqID:start..end'. Error: {e}")
+        log(f"Error parsing syncoord: {syncoord}. Expected format 'accessionID_seqID:start..end'. Error: {e}")
         return None
 
-    print(f"Extracting sequence from {fasta_file} with syncoord {syncoord} (reverse_complement={reverse_complement})")
+    log(f"Extracting sequence from {fasta_file} with syncoord {syncoord} (reverse_complement={reverse_complement})")
 
-    # Read the genome file
     with open(fasta_file, "r") as handle:
         for record in SeqIO.parse(handle, "fasta"):
             if record.id == f"{accession_id}_{seqid}":
-                print(f"Found matching header: {record.id}")
                 seq = record.seq[start-1:end]
                 if reverse_complement:
-                    print(f"Reverse complementing sequence: {record.id}")
                     seq = seq.reverse_complement()
                 return SeqRecord(seq, id=record.id, description="")
-    print(f"No matching header found for {syncoord} in {fasta_file}")
+    log(f"No matching header found for {syncoord} in {fasta_file}")
     return None
 
 # Function to extract start position from file name
 def extract_start_pos(file_name):
-    # file_name is something like 'TaestD_chr4_100_200.fa'
-    base_name = os.path.basename(file_name)
-    base_name = base_name.replace('.fa', '')
-    parts = base_name.split('_')
-    start = int(parts[-2])
-    return start
+    base = os.path.basename(file_name).replace('.fa', '')
+    parts = base.split('_')
+    return int(parts[-2])
 
+# Convert timer string to seconds
 def convert_timer_to_seconds(timer_str):
     if not timer_str:
         return None
     unit = timer_str[-1]
     value = int(timer_str[:-1])
-    
-    if unit == 'd':
-        return value * 86400  # 1 day = 86400 seconds
-    elif unit == 'h':
-        return value * 3600   # 1 hour = 3600 seconds
-    elif unit == 'm':
-        return value * 60     # 1 minute = 60 seconds
-    elif unit == 's':
-        return value          # seconds
-    else:
-        raise ValueError(f"Invalid time unit in '{timer_str}'. Use 'd', 'h', 'm', or 's'.")
+    if unit == 'd': return value * 86400
+    if unit == 'h': return value * 3600
+    if unit == 'm': return value * 60
+    if unit == 's': return value
+    raise ValueError(f"Invalid time unit in '{timer_str}'. Use 'd', 'h', 'm', or 's'.")
 
-# Function to run minimap2 alignment and adjust coordinates
+# Run minimap2 alignment and adjust coordinates
 def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
-    # Use the downloaded minimap2 binary
-    cmd = f"{MINIMAP2_BIN} -t {threads} --secondary=no -k {kmer} --cs=short -x asm10 -c {seq1_file} {seq2_file}"
-    print(f"Running minimap2 with command: {cmd}")
-    
-    # Extract start positions from seq1_file and seq2_file
+    cmd = (
+        f"{MINIMAP2_BIN} -t {threads} --secondary=no "
+        f"-k {kmer} --cs=short -x {PRESET} -c {seq1_file} {seq2_file}"
+    )
+    log(f"Running minimap2 with command: {cmd}")
     start1 = extract_start_pos(seq1_file)
     start2 = extract_start_pos(seq2_file)
-    
     try:
-        # Run minimap2 and apply the timer if specified
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timer)
-        
         if result.returncode != 0:
-            print(f"Error running minimap2: {result.stderr}")
+            log(f"Error running minimap2: {result.stderr}")
             return
-        
-        # Process the output line by line
-        adjusted_lines = []
+        adjusted = []
         for line in result.stdout.strip().split('\n'):
-            if line.strip() == '':
-                continue
-            cols = line.strip().split('\t')
+            if not line: continue
+            cols = line.split('\t')
             if len(cols) < 12:
-                print(f"Invalid PAF line: {line}")
+                log(f"Invalid PAF line: {line}")
                 continue
-            cols[2] = str(int(cols[2]) + start2)  # Add target (seq2) start position to column 3
-            cols[3] = str(int(cols[3]) + start2)  # Add target (seq2) start position to column 4
-            cols[7] = str(int(cols[7]) + start1)  # Add query (seq1) start position to column 8
-            cols[8] = str(int(cols[8]) + start1)  # Add query (seq1) start position to column 9
-            adjusted_line = '\t'.join(cols)
-            adjusted_lines.append(adjusted_line)
-        
-        # Write adjusted lines to output_file
+            cols[2] = str(int(cols[2]) + start2)
+            cols[3] = str(int(cols[3]) + start2)
+            cols[7] = str(int(cols[7]) + start1)
+            cols[8] = str(int(cols[8]) + start1)
+            adjusted.append('\t'.join(cols))
         with open(output_file, 'a') as f:
-            for line in adjusted_lines:
-                f.write(line + '\n')
-    
+            for l in adjusted:
+                f.write(l + '\n')
     except subprocess.TimeoutExpired:
-        print(f"Process took longer than {timer} seconds. Skipping this alignment.")
-        # No need to write anything if the process timed out.
+        log(f"Process took longer than {timer} seconds. Skipping this alignment.")
 
-# Function to process each line of coords
+# Process each line of coords
 def process_line(args):
-    line, genome_dir, temp_dir_base, kmer, threads, output_file, debug_mode, timer = args
+    line, genome_dir, temp_base, kmer, threads, output_file, debug_mode, timer, counter = args
     syncoord1, syncoord2, strand = line.strip().split("\t")
-    
-    print(f"Processing line: {line.strip()}")
+    log(f"Processing line: {line.strip()}")
 
-    # Create a unique temp directory for this process_line call
-    temp_dir = tempfile.mkdtemp(dir=temp_dir_base)
-    print(f"Created temp directory: {temp_dir}")
-    
-    # Create temp files for the two syncoords
+    temp_dir = tempfile.mkdtemp(dir=temp_base)
     seq1_file = os.path.join(temp_dir, syncoord1.replace(":", "_").replace("..", "_") + ".fa")
     seq2_file = os.path.join(temp_dir, syncoord2.replace(":", "_").replace("..", "_") + ".fa")
-    
-    print(f"Temp files: {seq1_file}, {seq2_file}")
 
-    # Extract sequences
     genome1 = os.path.join(genome_dir, syncoord1.split(":")[0].split("_")[0] + "_mod.fa")
     genome2 = os.path.join(genome_dir, syncoord2.split(":")[0].split("_")[0] + "_mod.fa")
-    
-    print(f"Accessing genome files: {genome1}, {genome2}")
 
     seq1 = extract_sequence(genome1, syncoord1)
     seq2 = extract_sequence(genome2, syncoord2, reverse_complement=(strand == "-"))
 
-    if seq1 is None or seq2 is None:
-        print(f"Skipping line due to missing sequences for {syncoord1} or {syncoord2}")
-        # Clean up temp directory
-        if not debug_mode:
-            os.rmdir(temp_dir)
-        return
-
-    # Write sequences to temp files
-    SeqIO.write(seq1, seq1_file, "fasta")
-    SeqIO.write(seq2, seq2_file, "fasta")
-    print(f"Wrote temp sequence files: {seq1_file}, {seq2_file}")
-
-    # Run minimap2 alignment and adjust coordinates
-    run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer)
-
-    # Clean up temp files and temp directory if not in debug mode
+    if seq1 and seq2:
+        SeqIO.write(seq1, seq1_file, "fasta")
+        SeqIO.write(seq2, seq2_file, "fasta")
+        run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer)
+    # Clean up
     if not debug_mode:
-        print(f"Removing temp files and directory: {temp_dir}")
-        os.remove(seq1_file)
-        os.remove(seq2_file)
-        os.rmdir(temp_dir)
-    else:
-        print(f"Debug mode on, temp files and directory retained: {temp_dir}")
+        try:
+            os.remove(seq1_file)
+            os.remove(seq2_file)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+    # Increment processed counter
+    counter.value += 1
 
-# Main function
+# Main entry point
 def main():
-    parser = argparse.ArgumentParser(description="Syntenic genomic sequence extraction and alignment using minimap2.")
-    parser.add_argument("-pairedIDs", nargs='+', help="List of accession IDs to include for analysis.")
-    parser.add_argument("-singleID", help="Single accession ID to include for analysis.")
-    parser.add_argument("-k", "--kmer", type=int, default=28, help="Kmer size for minimap2.")
-    parser.add_argument("-t", "--threads", type=int, default=3, help="Number of threads for minimap2.")
-    parser.add_argument("-p", "--processes", type=int, default=10, help="Number of parallel processes.")
-    parser.add_argument("-c", "--coords", required=True, help="Input file containing syntenic coordinates.")
-    parser.add_argument("-d", "--debug", action="store_true", help="Debug mode: retain temp files.")
-    parser.add_argument("--timer", type=str, help="Set a timer for each minimap2 process. Format: [int][d/h/m/s], e.g., '2m' for 2 minutes.")
+    parser = argparse.ArgumentParser(
+        description="Syntenic genomic sequence extraction and alignment using minimap2."
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-pairedIDs", nargs='+', help="List of accession IDs to include for analysis.")
+    group.add_argument("-singleID", help="Single accession ID to include for analysis.")
+    parser.add_argument("-k", "--kmer", type=int, default=28,
+                        help="Kmer size for minimap2.")
+    parser.add_argument("-t", "--threads", type=int, default=3,
+                        help="Number of threads for minimap2.")
+    parser.add_argument("-p", "--processes", type=int, default=10,
+                        help="Number of parallel processes.")
+    parser.add_argument("-c", "--coords", required=True,
+                        help="Input file containing syntenic coordinates.")
+    parser.add_argument("--timer", type=str,
+                        help="Set a timer for each minimap2 process. Format: [int][d/h/m/s].")
+    parser.add_argument("--preset", choices=["asm5", "asm10", "asm20"], default="asm10",
+                        help="minimap2 preset (default: asm10).")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose QC output.")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="Debug mode: retain temp files.")
     args = parser.parse_args()
 
-    # Check mutual exclusivity between pairedIDs and singleID
-    if args.pairedIDs and args.singleID:
-        parser.error("Cannot use both -pairedIDs and -singleID. Use one option.")
+    global PRESET, VERBOSE
+    PRESET = args.preset
+    VERBOSE = args.verbose
 
-    # Set output file for minimap2 alignments
     output_file = "alignment.paf"
-    print(f"Output file: {output_file}")
+    log(f"Output file: {output_file}")
 
-    # Download the latest minimap2 release into a temporary directory.
-    # My conda version is out of date. 
-    # This will need updated as newer minimap2 updates are released. 
+    # Download latest minimap2
     temp_minimap_dir = tempfile.mkdtemp(prefix="minimap2_download_")
-    download_cmd = f"curl -L https://github.com/lh3/minimap2/releases/download/v2.28/minimap2-2.28_x64-linux.tar.bz2 | tar -jxvf - -C {temp_minimap_dir}"
-    print(f"Downloading minimap2 using command: {download_cmd}")
-    subprocess.run(download_cmd, shell=True, check=True)
+    metadata = subprocess.check_output([
+        "curl", "-s",
+        "https://api.github.com/repos/lh3/minimap2/releases/latest"
+    ], text=True)
+    import json
+    tag = json.loads(metadata)["tag_name"].lstrip("v")
+    tarball = f"minimap2-{tag}_x64-linux.tar.bz2"
+    url = f"https://github.com/lh3/minimap2/releases/download/v{tag}/{tarball}"
+    log(f"Downloading minimap2 v{tag} from {url}")
+    subprocess.run(
+        f"curl -L {url} | tar -jxvf - -C {temp_minimap_dir}",
+        shell=True, check=True
+    )
     global MINIMAP2_BIN
-    MINIMAP2_BIN = os.path.join(temp_minimap_dir, "minimap2-2.28_x64-linux", "minimap2")
-    print(f"Using minimap2 binary at: {MINIMAP2_BIN}")
+    MINIMAP2_BIN = os.path.join(
+        temp_minimap_dir,
+        f"minimap2-{tag}_x64-linux",
+        "minimap2"
+    )
+    log(f"Using minimap2 binary at: {MINIMAP2_BIN}")
 
-    # Load coords
+    # Read and filter coords
     with open(args.coords, "r") as f:
         lines = f.readlines()
+    filtered = []
+    for line in lines:
+        syn1, syn2, _ = line.strip().split("\t")
+        acc1 = syn1.split(":")[0].split("_")[0]
+        acc2 = syn2.split(":")[0].split("_")[0]
+        if args.pairedIDs and (acc1 in args.pairedIDs and acc2 in args.pairedIDs):
+            filtered.append(line)
+        elif args.singleID and (acc1 == args.singleID or acc2 == args.singleID):
+            filtered.append(line)
+        elif not args.pairedIDs and not args.singleID:
+            filtered = lines
+    total = len(filtered)
+    log(f"Total lines to process: {total}")
 
-    print(f"Loaded {len(lines)} lines from {args.coords}")
+    # Prepare temp base
+    temp_base = os.path.abspath("./minimap_temp")
+    os.makedirs(temp_base, exist_ok=True)
 
-    # Filter lines based on pairedIDs or singleID
-    if args.pairedIDs or args.singleID:
-        filtered_lines = []
-        for line in lines:
-            syncoord1, syncoord2, strand = line.strip().split("\t")
-            accessions1 = syncoord1.split(":")[0].split("_")[0]  # Extract accessionID before underscore
-            accessions2 = syncoord2.split(":")[0].split("_")[0]  # Extract accessionID before underscore
+    # Shared counter for progress
+    manager = Manager()
+    counter = manager.Value('i', 0)
 
-            if args.pairedIDs and (accessions1 in args.pairedIDs and accessions2 in args.pairedIDs):
-                print(f"Adding line to filtered_lines (both in pairedIDs): {line.strip()}")
-                filtered_lines.append(line)
-            elif args.singleID and (accessions1 == args.singleID or accessions2 == args.singleID):
-                print(f"Adding line to filtered_lines (one in singleID): {line.strip()}")
-                filtered_lines.append(line)
-    else:
-        filtered_lines = lines
+    # Progress reporter thread
+    stop_event = threading.Event()
+    def reporter():
+        iteration = 1
+        while not stop_event.is_set() and counter.value < total:
+            time.sleep(60)
+            if counter.value >= total:
+                break
+            percent = int((counter.value / total) * 100)
+            print(f"{iteration*1} minute: {percent}% complete")
+            iteration += 1
+    thread = threading.Thread(target=reporter)
+    thread.daemon = True
+    thread.start()
 
-    print(f"Filtered down to {len(filtered_lines)} lines based on accessions of interest")
-
-    # Prepare temp directory base for per-alignment temporary files
-    temp_dir_base = "./minimap_temp"
-    os.makedirs(temp_dir_base, exist_ok=True)
-
-    # Process lines with multiprocessing
-    timer_seconds = convert_timer_to_seconds(args.timer)
-    args_list = [(line, ".", temp_dir_base, args.kmer, args.threads, output_file, args.debug, timer_seconds) for line in filtered_lines]
-    print(f"Processing {len(args_list)} lines with {args.processes} processes")
+    # Launch pool of workers
+    timer_sec = convert_timer_to_seconds(args.timer)
+    tasks = [
+        (line, ".", temp_base, args.kmer, args.threads,
+         output_file, args.debug, timer_sec, counter)
+        for line in filtered
+    ]
     with Pool(processes=args.processes) as pool:
-        pool.map(process_line, args_list)
+        pool.map(process_line, tasks)
 
-    # Clean up base temp directory if not in debug mode
+    # Signal reporter to stop
+    stop_event.set()
+
+    # Cleanup
     if not args.debug:
-        print(f"Removing base temp directory: {temp_dir_base}")
         try:
-            os.rmdir(temp_dir_base)
+            os.rmdir(temp_base)
         except OSError:
-            print(f"Could not remove {temp_dir_base}, it may not be empty.")
-
-    # Delete the downloaded minimap2 directory
-    print(f"Removing downloaded minimap2 directory: {temp_minimap_dir}")
+            pass
+    log(f"Removing downloaded minimap2 directory: {temp_minimap_dir}")
     shutil.rmtree(temp_minimap_dir)
 
 if __name__ == "__main__":
