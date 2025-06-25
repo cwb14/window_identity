@@ -64,7 +64,7 @@ def convert_timer_to_seconds(timer_str):
     raise ValueError(f"Invalid time unit in '{timer_str}'. Use 'd', 'h', 'm', or 's'.")
 
 # Run minimap2 alignment and adjust coordinates
-def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, orig_line):
+def run_minimap(seq1_file, seq2_file, output_file, threads, timer, orig_line):
     """
     Run minimap2 on two temporary FASTA files, adjust PAF coordinates by the window starts,
     and append results to output_file. On timeout, let the exception bubble up so the caller
@@ -72,7 +72,7 @@ def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, orig_li
     """
     cmd = (
         f"{MINIMAP2_BIN} -t {threads} --secondary=no "
-        f"-k {kmer} --cs=short -x {PRESET} -c {seq1_file} {seq2_file}"
+        f"--cs=short -x {PRESET} -c {seq1_file} {seq2_file}"
     )
     log(f"Running minimap2 with command: {cmd}")
     start1 = extract_start_pos(seq1_file)
@@ -115,7 +115,7 @@ def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, orig_li
 
 # Process each line of coords
 def process_line(args):
-    line, genome_dir, temp_base, kmer, threads, output_file, debug_mode, timer, counter = args
+    line, genome_dir, temp_base, threads, output_file, debug_mode, timer, counter = args
     syncoord1, syncoord2, strand = line.strip().split("\t")
     log(f"Processing line: {line.strip()}")
 
@@ -134,7 +134,7 @@ def process_line(args):
         SeqIO.write(seq2, seq2_file, "fasta")
         try:
             # pass the original line so run_minimap can report on timeouts
-            run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, line)
+            run_minimap(seq1_file, seq2_file, output_file, threads, timer, line)
             
         except subprocess.TimeoutExpired:
             # timeout → split the two coords at their midpoints and re-run
@@ -168,7 +168,7 @@ def process_line(args):
 #                    # write temp FASTAs
 #                    SeqIO.write(rec1, seq1_file, "fasta")
 #                    SeqIO.write(rec2, seq2_file, "fasta")
-#                    run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, f"{new1}\t{new2}\t{strand}")
+#                    run_minimap(seq1_file, seq2_file, output_file, threads, timer, f"{new1}\t{new2}\t{strand}")
 
             for new1, new2 in ((first, first2), (second, second2)):
                 rec1 = extract_sequence(genome1, new1)
@@ -180,7 +180,7 @@ def process_line(args):
 
                 try:
                     run_minimap(seq1_file, seq2_file, output_file,
-                                kmer, threads, timer,
+                                threads, timer,
                                 f"{new1}\t{new2}\t{strand}")
                 except subprocess.TimeoutExpired:
                     # if *this* half still times out, split it again
@@ -188,7 +188,7 @@ def process_line(args):
                     # or call a helper to do it recursively:
                     process_line((f"{new1}\t{new2}\t{strand}",
                                   genome_dir, temp_base,
-                                  kmer, threads,
+                                  threads,
                                   output_file, debug_mode,
                                   timer, counter))
 
@@ -211,8 +211,6 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-pairedIDs", nargs='+', help="List of accession IDs to include for analysis.")
     group.add_argument("-singleID", help="Single accession ID to include for analysis.")
-    parser.add_argument("-k", "--kmer", type=int, default=28,
-                        help="Kmer size for minimap2.")
     parser.add_argument("-t", "--threads", type=int, default=3,
                         help="Number of threads for minimap2.")
     parser.add_argument("-p", "--processes", type=int, default=10,
@@ -302,7 +300,7 @@ def main():
     # Launch pool of workers
     timer_sec = convert_timer_to_seconds(args.timer)
     tasks = [
-        (line, ".", temp_base, args.kmer, args.threads,
+        (line, ".", temp_base, args.threads,
          output_file, args.debug, timer_sec, counter)
         for line in filtered
     ]
