@@ -64,7 +64,12 @@ def convert_timer_to_seconds(timer_str):
     raise ValueError(f"Invalid time unit in '{timer_str}'. Use 'd', 'h', 'm', or 's'.")
 
 # Run minimap2 alignment and adjust coordinates
-def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
+def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, orig_line):
+    """
+    Run minimap2 on two temporary FASTA files, adjust PAF coordinates by the window starts,
+    and append results to output_file. On timeout, let the exception bubble up so the caller
+    can print the skipped coordinate line.
+    """
     cmd = (
         f"{MINIMAP2_BIN} -t {threads} --secondary=no "
         f"-k {kmer} --cs=short -x {PRESET} -c {seq1_file} {seq2_file}"
@@ -72,28 +77,41 @@ def run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer):
     log(f"Running minimap2 with command: {cmd}")
     start1 = extract_start_pos(seq1_file)
     start2 = extract_start_pos(seq2_file)
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timer)
-        if result.returncode != 0:
-            log(f"Error running minimap2: {result.stderr}")
-            return
-        adjusted = []
-        for line in result.stdout.strip().split('\n'):
-            if not line: continue
-            cols = line.split('\t')
-            if len(cols) < 12:
-                log(f"Invalid PAF line: {line}")
-                continue
-            cols[2] = str(int(cols[2]) + start2)
-            cols[3] = str(int(cols[3]) + start2)
-            cols[7] = str(int(cols[7]) + start1)
-            cols[8] = str(int(cols[8]) + start1)
-            adjusted.append('\t'.join(cols))
-        with open(output_file, 'a') as f:
-            for l in adjusted:
-                f.write(l + '\n')
-    except subprocess.TimeoutExpired:
-        log(f"Process took longer than {timer} seconds. Skipping this alignment.")
+
+    # Let subprocess.TimeoutExpired bubble up to the caller
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=timer
+    )
+
+    # If minimap2 returns an error, log and return
+    if result.returncode != 0:
+        log(f"Error running minimap2: {result.stderr}")
+        return
+
+    # Parse and shift PAF coordinates
+    adjusted = []
+    for paf_line in result.stdout.strip().split('\n'):
+        if not paf_line:
+            continue
+        cols = paf_line.split('\t')
+        if len(cols) < 12:
+            log(f"Invalid PAF line: {paf_line}")
+            continue
+        # shift query (cols[2], cols[3]) by start2 and target (cols[7], cols[8]) by start1
+        cols[2] = str(int(cols[2]) + start2)
+        cols[3] = str(int(cols[3]) + start2)
+        cols[7] = str(int(cols[7]) + start1)
+        cols[8] = str(int(cols[8]) + start1)
+        adjusted.append('\t'.join(cols))
+
+    # Write adjusted lines to the output PAF
+    with open(output_file, 'a') as f:
+        for line in adjusted:
+            f.write(line + '\n')
 
 # Process each line of coords
 def process_line(args):
@@ -114,7 +132,16 @@ def process_line(args):
     if seq1 and seq2:
         SeqIO.write(seq1, seq1_file, "fasta")
         SeqIO.write(seq2, seq2_file, "fasta")
-        run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer)
+        try:
+            # pass the original line so run_minimap can report on timeouts
+            run_minimap(seq1_file, seq2_file, output_file, kmer, threads, timer, line)
+        except subprocess.TimeoutExpired:
+            # always print the skipped coords, regardless of --verbose
+            print(f"Skipping coordinates line '{line.strip()}'")
+            # if you still want the verbose log, you can do:
+            if VERBOSE:
+                log(f"Process took longer than {timer} seconds. Skipping this alignment.")
+
     # Clean up
     if not debug_mode:
         try:
