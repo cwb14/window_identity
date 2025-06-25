@@ -117,7 +117,7 @@ if [[ -z "$REF" ]]; then
     exit 1
 fi
 
-if [[ \${#QUERY_GENOMES[@]} -eq 0 ]]; then
+if [[ ${#QUERY_GENOMES[@]} -eq 0 ]]; then
     echo "Error: At least one query genome (-query) is required."
     usage
     exit 1
@@ -339,10 +339,20 @@ done <jcvi_list.txt
 echo "Step 9 - Merge the pairwise anchor files"
 cat "${coords_files[@]}" >all.anchors.coords
 
+# ===== Polish the anchor coordinates by removing overlapping alns =====
+POLISHED="all.anchors.coords.polished"
+if [[ ! -s "$POLISHED" ]]; then
+    echo "Step 9.1 - Polishing merged anchor coordinates"
+    python "$BIN_DIR/anchor_coord_subtracter.py" all.anchors.coords "$POLISHED"
+else
+    echo "Polished coords file $POLISHED exists. Skipping."
+fi
+# ======================================================================
+
 # Step 10 - Align the genomic anchors
 if [[ ! -s "alignment.paf" ]]; then
     echo "Step 10 - Align the genomic anchors"
-    python "$BIN_DIR/synmap.py" --timer 8h -t "$THREADS" -p "$PROCESSES" --preset "$X_TYPE" -c all.anchors.coords 
+    python -u "$BIN_DIR/synmap_split.py" --timer 10m -t "$THREADS" -p "$PROCESSES" --preset "$X_TYPE" -c all.anchors.coords.polished
     # I can use 'paftools.js view' to visualize aln quality and optimize parameters.
     # The minimap2 parameters likely need optimized since k2p seems off.
 else
