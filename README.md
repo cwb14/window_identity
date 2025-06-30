@@ -1,6 +1,5 @@
-#### Plotting gap compresses sequence identy across chromosomes using weighted averages to calculate sequence identity per window.
-#### Supports 1v1, 1v2, 1v3, etc.
-Basic usage.
+#### Plotting gap compresses sequence identy across chromosomes using weighted averages to calculate sequence identity per window.  
+Basic usage.  
 ```
 bash window_identity/weighted_seq_ident_calc2.sh -threads 10 -mutation_rate 3e-8 -x asm20 -ref Zmays.fa -query Zsini.fa Bdact.fa Etef.fa Tgree.fa OkokoW.fa Eindi.fa
 ```
@@ -12,6 +11,7 @@ bash window_identity/weighted_seq_ident_calc2.sh
 
 
 #### Note....  
+##### One #####
 Currently, it uses UPGMA on distance matrix.   
 We could also use minimum evoltuion approach for flexibility for varying mutation rates across phyla.   
 Convert distance matrix to phy format.   
@@ -48,3 +48,9 @@ Might need to reroot to outgroup.
 ```
 nw_reroot k2p_matrix.fastme.nwk Zmays > k2p_matrix.fastme.reroot.nwk
 ```
+
+##### Two #####
+Consider enhancing `all.anchors.coords.polished` to include inter-anchor interval.  
+Consider flexibility to support wavefront alignment (WFA) in addition to minimap2 in `synmap_split.py`. 
+
+
