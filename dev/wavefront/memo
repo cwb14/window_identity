@@ -1,0 +1,15 @@
+In the indels dir, I was observing that minimap2 alignments werent great for detecting indels that coorespond to TEs
+I read that a wavefront aligner might help solve, but alas, my alignments are crappy (you can see by the gap compressed sequence identity in column 4). Im seeing 70% sequence idenity between syntenic segments of two arabidosis genomes, which doesnt seem right.  
+Not entirely sure the issue. I think enforcing global end-to-end alignments over large swaths (>1mb) causes forced errors over structurally variable regions, but not sure. 
+Its built with 'synmap_split.py' in mind, which uses JCVI anchors and minimap2. 
+My anchor approach uses blocks of genes. I may be able to solve the issue by shortening to syntenic pairs:
+> genome1
+[gene1_start].......[gene2_end]
+> genome2
+[gene1_start].......[gene2_end]
+
+Rather than:
+> genome1
+[block1_start].......[block1_end]
+> genome2
+[block1_start].......[block1_end]

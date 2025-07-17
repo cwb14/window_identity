@@ -1,0 +1,4 @@
+Scripts to identify TE indels from minimap2 alignments. 
+Doesnt work too well, but the concepts are nice and sometimes works.  
+Minimap2 is not really designed for this purpose, which I think might be the issue. 
+I was using EDTA annotations as the GFF.
