@@ -13,3 +13,53 @@ Rather than:
 [block1_start].......[block1_end]
 > genome2
 [block1_start].......[block1_end]
+
+
+I address the above probelm a little:
+# This version does gene-to-gene rather than block-to-block.
+python window_identity/bin/gene_coords_extractor_all4_pairs.py -mcscan Col0.Alt5.clean.anchors  > Col0.Alt5.clean.anchors.mod.coords.pairs
+# Remove redundancies.
+python window_identity/bin/anchor_coord_subtracter.py Col0.Alt5.clean.anchors.mod.coords.pairs Col0.Alt5.clean.anchors.mod.coords.pairs.clean
+# Here, I need '-d' to signify to keep those alignment sequences so I can use them with wavefront. 
+python window_identity/bin/synmap_split.py -c Col0.Alt5.clean.anchors.mod.coords.pairs.clean -d --preset asm5 -t 20 -p 200
+
+# I can use something like this to run wavefront over each temp file.
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Directory containing your syntenic-pair subdirs
+MINIMAP_DIR="./minimap_temp"
+
+# Path to the wavefront_global binary
+WAVE_BIN="./window_identity/dev/wavefront/wavefront_global"
+
+# Output file (will be created/truncated)
+OUTFILE="wavefront_alns.tsv"
+: > "$OUTFILE"
+
+export WAVE_BIN OUTFILE
+
+# Find each subdirectory under MINIMAP_DIR, then for each one:
+#   - run wavefront_global on the Alt5*.fa and Col0*.fa files
+#   - append output to $OUTFILE
+# Up to 10 jobs will run in parallel.
+find "$MINIMAP_DIR" -mindepth 1 -maxdepth 1 -type d | \
+  xargs -P1 -I {} bash -c ' ##### I CAN CRANK UP P HERE FOR MULTITHREADING, BUT MULT-CORES PUSHING TO "$OUTFILE" AT THE SAME TIME CAUSES LINES TO SPLIT AND NEST. WOULD NEED TO FIX. '-P1' WORKS.
+    "$WAVE_BIN" "$1"/Alt5*.fa "$1"/Col0*.fa >> "$OUTFILE"
+  ' _ {}
+
+echo "Done — all alignments are in $OUTFILE"
+
+
+# Output looks like this:
+./minimap_temp/tmpnzyekzzt/Alt5_chr4_1251315_1257689.fa	./minimap_temp/tmpnzyekzzt/Col0_chr4_387840_394210.fa	305=1X1363=1X438=1X729=1X5=1X41=1X43=1I2=1D896=1X132=2D48=1X164=1X82=1X182=1D277=1X1=1X43=1X51=1X573=1X75=10I11D895=	0.996701
+./minimap_temp/tmpvxuifnlk/Alt5_chr4_21331213_21335316.fa	./minimap_temp/tmpvxuifnlk/Col0_chr4_15241832_15245930.fa	322=1X24=1X225=1X7=17I17D243=1X860=1X382=1X419=18D106=2I62=10I2=2I66=1X443=1X574=1X152=1X3=1D168=	0.995828
+
+# Obviously, some cleanup would be needed. 
+# Should Prolly be:
+Alt5_chr4  1251315  1257689	[QUERY_LEN]  Col0_chr4  387840  394210	[TARGET_LEN]  305=1X1363=1X438=1X729=1X5=1X41=1X43=1I2=1D896=1X132=2D48=1X164=1X82=1X182=1D277=1X1=1X43=1X51=1X573=1X75=10I11D895=	0.996701
+Alt5_chr4  21331213  21335316	[QUERY_LEN]	Col0_chr4  15241832  [TARGET_LEN]  15245930	322=1X24=1X225=1X7=17I17D243=1X860=1X382=1X419=18D106=2I62=10I2=2I66=1X443=1X574=1X152=1X3=1D168=	0.995828
+
+# With sequence, I could rebuild cs string to calculate k2p or something, but not sure its worth the trouble, since the goal is TE indels and i could do it from the cigar alone. 
+
+
