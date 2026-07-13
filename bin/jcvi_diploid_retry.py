@@ -8,7 +8,14 @@ parser = argparse.ArgumentParser(description='Run jcvi.compara.catalog ortholog 
 parser.add_argument('-p', metavar='N', type=int, default=16, help='Number of processes to run in parallel (default: 16)')
 parser.add_argument('--cpus', type=int, default=1, help='Number of CPUs to use for each subprocess (default: 1)')
 parser.add_argument('--blast', '-b', action='store_true', help='Include --align_soft blast in the command')
+parser.add_argument('--prot', action='store_true',
+                    help='Use DIAMOND protein (adds --align_soft diamond_blastp --dbtype prot). Mirrors jcvi_diploid.py.')
+parser.add_argument('--cscore', type=float, default=0.99,
+                    help='Pass-through value for --cscore (default: 0.99)')
 args = parser.parse_args()
+
+if args.blast and args.prot:
+    raise SystemExit("Error: --blast and --prot are mutually exclusive.")
 
 # Ensure that both --cpus and -p are set to at least 1
 args.cpus = max(1, args.cpus)
@@ -35,10 +42,13 @@ def run_command(line):
     if is_missing_or_empty(last_file) or is_missing_or_empty(anchors_file):
         command = [
             'python', '-m', 'jcvi.compara.catalog', 'ortholog',
-            col1, col2, '--no_strip_names', f'--cpus={args.cpus}', '--notex', '--cscore=.99'
+            col1, col2, '--no_strip_names', f'--cpus={args.cpus}', '--notex',
+            f'--cscore={args.cscore}'
         ]
         if args.blast:
             command.extend(['--align_soft', 'blast'])
+        elif args.prot:
+            command.extend(['--align_soft', 'diamond_blastp', '--dbtype', 'prot'])
         subprocess.run(command)
 
 # Read all lines from the selected list file into a list

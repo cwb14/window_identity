@@ -18,6 +18,15 @@ REF=""
 QUERY_GENOMES=()
 # Divergence mapping option for synmap.py
 X_TYPE="asm10"
+# Protein liftover (Steps 2-4) and anchoring (Step 5). Defaults match synLTR/module1.py.
+OUTN=1
+OUTS=0.95
+OUTC=0.9
+TESORTER="yes"
+CSCORE=0.99
+# Synteny block consolidation (see Steps 6-9). Defaults match synLTR/module1.py.
+MIN_BLOCK_SIZE=15000
+STITCH_GAPS="yes"
 
 # Help menu function
 usage() {
@@ -39,6 +48,26 @@ Options:
   -include_mean_line yes|no    Include mean line in plot (default: $INCLUDE_MEAN_LINE)
   -ymax YMAX                   Y-axis maximum for plot
   -x asm5|asm10|asm20          Sequence divergence mapping for synmap.py (default: $X_TYPE)
+  -outn N                      miniprot --outn: max alignments reported per protein
+                               (default: $OUTN). Raise for polyploids.
+  -outs FLOAT                  miniprot --outs: keep alignments scoring >= this fraction of
+                               the best hit for that protein (default: $OUTS).
+  -outc FLOAT                  miniprot --outc: min fraction of the protein that must align
+                               (default: $OUTC).
+  -tesorter yes|no             Strip TE-derived peptides from the reference proteome with a
+                               two-pass TEsorter + blastp screen (default: $TESORTER). TE
+                               proteins seed false anchors genome-wide; leave this on unless
+                               you are certain the proteome is already TE-free. Slow.
+  -cscore FLOAT                jcvi --cscore (default: $CSCORE). ~0.99 is RBH-like; lower it
+                               for polyploids.
+  -min_block_size N            Anchor blocks with BOTH sides >= N are kept as-is; smaller
+                               blocks are merged into overlapping neighbours (default: $MIN_BLOCK_SIZE).
+                               Larger values merge more aggressively, yielding fewer/bigger
+                               blocks and a faster minimap2 step in Step 10.
+  -stitch_gaps yes|no          Fill the gap between consecutive syntenic blocks with a
+                               synthetic block, so inter-anchor intervals are aligned rather
+                               than dropped (default: $STITCH_GAPS). Guarded against inversions
+                               and rearrangements.
   -h, --help                   Show this help message and exit
 EOF
 }
@@ -102,6 +131,34 @@ while [[ $# -gt 0 ]]; do
         X_TYPE="$2"
         shift; shift
         ;;
+    -outn)
+        OUTN="$2"
+        shift; shift
+        ;;
+    -outs)
+        OUTS="$2"
+        shift; shift
+        ;;
+    -outc)
+        OUTC="$2"
+        shift; shift
+        ;;
+    -tesorter)
+        TESORTER="$2"
+        shift; shift
+        ;;
+    -cscore)
+        CSCORE="$2"
+        shift; shift
+        ;;
+    -min_block_size)
+        MIN_BLOCK_SIZE="$2"
+        shift; shift
+        ;;
+    -stitch_gaps)
+        STITCH_GAPS="$2"
+        shift; shift
+        ;;
     *)
         echo "Error: Unknown option $1"
         usage
@@ -121,6 +178,59 @@ if [[ ${#QUERY_GENOMES[@]} -eq 0 ]]; then
     echo "Error: At least one query genome (-query) is required."
     usage
     exit 1
+fi
+
+if [[ ! -s "$PROTEIN" ]]; then
+    echo "Error: reference proteome not found or empty: $PROTEIN"
+    echo "       Supply one with -peptide."
+    exit 1
+fi
+
+if ! [[ "$MIN_BLOCK_SIZE" =~ ^[0-9]+$ ]]; then
+    echo "Error: -min_block_size must be a non-negative integer (got '$MIN_BLOCK_SIZE')."
+    exit 1
+fi
+
+if ! [[ "$OUTN" =~ ^[0-9]+$ ]]; then
+    echo "Error: -outn must be a non-negative integer (got '$OUTN')."
+    exit 1
+fi
+
+case "$STITCH_GAPS" in
+    yes|no) ;;
+    *) echo "Error: -stitch_gaps must be 'yes' or 'no' (got '$STITCH_GAPS')."; exit 1 ;;
+esac
+
+case "$TESORTER" in
+    yes|no) ;;
+    *) echo "Error: -tesorter must be 'yes' or 'no' (got '$TESORTER')."; exit 1 ;;
+esac
+
+# Fail fast on missing tools rather than part-way through a long run.
+required_tools=(python miniprot bedtools bioawk samtools cd-hit diamond)
+if [[ "$TESORTER" == "yes" ]]; then
+    required_tools+=(TEsorter seqkit blastp makeblastdb)
+fi
+missing_tools=()
+for tool in "${required_tools[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
+done
+if [[ ${#missing_tools[@]} -gt 0 ]]; then
+    echo "Error: missing required tool(s): ${missing_tools[*]}"
+    echo "       Install them into the active environment and re-run."
+    exit 1
+fi
+
+# Assembled once and reused by liftover.py in Steps 2-4.
+LIFTOVER_OPTS=(--outn "$OUTN" --outs "$OUTS" --outc "$OUTC" --cdhit)
+if [[ "$TESORTER" == "yes" ]]; then
+    LIFTOVER_OPTS+=(--TEsorter)
+fi
+
+# Assembled once and reused by the consolidator in Step 8.
+CONSOLIDATOR_OPTS=(-t "$MIN_BLOCK_SIZE")
+if [[ "$STITCH_GAPS" == "yes" ]]; then
+    CONSOLIDATOR_OPTS+=(--stitch-gaps)
 fi
 
 # Collect all genomes (reference and query)
@@ -157,62 +267,62 @@ else
     echo "Step 1 - Modified fasta files and jcvi_list.txt exist. Skipping."
 fi
 
-# Step 2 - Align proteins to each genomic input
-miniprot_outputs_exist=true
+# Steps 2-4 - Liftover the reference proteome onto each genome (liftover.py).
+#
+# Replaces the old raw-miniprot -> awk GFF-to-BED -> bedtools pseudo-CDS chain, matching
+# synLTR/module1.py. liftover.py wraps miniprot with score (--outs) and coverage (--outc)
+# filters, de-duplicates the reference proteome with cd-hit, and strips TE-derived peptides
+# via a two-pass TEsorter + blastp screen. TE proteins seed false anchors genome-wide, so
+# removing them is what makes the anchors trustworthy. Output is .pep (not pseudo-CDS), so
+# Step 5 anchors on protein rather than nucleotide.
+#
+# liftover.py names its outputs after the genome file, so '{id}_mod.fa' yields '{id}_mod.pep'
+# and '{id}_mod.bed'. jcvi_list.txt and the whole anchor chain key off the bare '{id}', so the
+# two are renamed below. '{id}_mod.gff' is deliberately left in place: liftover.py reuses an
+# existing GFF and skips the expensive miniprot run on resume.
+liftover_outputs_exist=true
 for genome in "${ALL_GENOMES[@]}"; do
     id="${GENOME_IDS[$genome]}"
-    gff_file="${id}.gff"
-    if [[ ! -s "$gff_file" ]]; then
-        miniprot_outputs_exist=false
+    if [[ ! -s "${id}.pep" || ! -s "${id}.bed" ]]; then
+        liftover_outputs_exist=false
         break
     fi
 done
 
-if [[ "$miniprot_outputs_exist" = false ]]; then
-    echo "Step 2 - Align proteins to each genomic input."
+if [[ "$liftover_outputs_exist" = false ]]; then
+    echo "Steps 2-4 - Liftover $PROTEIN onto each genome (tesorter=$TESORTER)"
+    mod_fastas=()
+    for genome in "${ALL_GENOMES[@]}"; do
+        mod_fastas+=("${GENOME_IDS[$genome]}_mod.fa")
+    done
+
+    echo "Running: python $BIN_DIR/liftover.py --genome ${mod_fastas[*]} --reference $PROTEIN ${LIFTOVER_OPTS[*]} --threads $THREADS --outputs gff pep bed"
+    python "$BIN_DIR/liftover.py" \
+        --genome "${mod_fastas[@]}" \
+        --reference "$PROTEIN" \
+        "${LIFTOVER_OPTS[@]}" \
+        --threads "$THREADS" \
+        --outputs gff pep bed
+
+    # Rename to the bare genome ID that jcvi_list.txt and the anchor chain expect.
     for genome in "${ALL_GENOMES[@]}"; do
         id="${GENOME_IDS[$genome]}"
-        mod_fasta="${id}_mod.fa"
-        gff_file="${id}.gff"
-        if [[ ! -s "$gff_file" ]]; then
-            echo "Running: miniprot -It $THREADS --gff $mod_fasta $PROTEIN -P $id --outn=10 > $gff_file"
-            miniprot -It "$THREADS" --gff "$mod_fasta" "$PROTEIN" -P "$id" --outn=10 >"$gff_file"
-        else
-            echo "GFF file $gff_file exists. Skipping miniprot for $id."
+        for ext in pep bed; do
+            if [[ -s "${id}_mod.${ext}" ]]; then
+                mv -f "${id}_mod.${ext}" "${id}.${ext}"
+            fi
+        done
+        if [[ ! -s "${id}.pep" || ! -s "${id}.bed" ]]; then
+            echo "Error: liftover produced no ${id}.pep / ${id}.bed."
+            echo "       Check that $PROTEIN aligns to ${id}_mod.fa."
+            exit 1
         fi
     done
 else
-    echo "Step 2 - GFF files exist. Skipping."
+    echo "Steps 2-4 - Liftover outputs (.pep/.bed) exist. Skipping."
 fi
 
-# Step 3 - Convert GFF into bed for each genomic input
-for genome in "${ALL_GENOMES[@]}"; do
-    id="${GENOME_IDS[$genome]}"
-    gff_file="${id}.gff"
-    bed_file="${id}.bed"
-    if [[ ! -s "$bed_file" ]]; then
-        echo "Converting $gff_file to $bed_file"
-        cat "$gff_file" | grep 'mRNA' | awk -F '\t' '{split($9,a,";"); split(a[1],id,"="); print $1 "\t" $4 "\t" $5 "\t" id[2]}' | grep "$id" | grep -v 'mapped' | awk 'NF==4' | bedtools sort -i - >"$bed_file"
-    else
-        echo "BED file $bed_file exists. Skipping."
-    fi
-done
-
-# Step 4 - Generate pseudo-CDS for each genomic input
-for genome in "${ALL_GENOMES[@]}"; do
-    id="${GENOME_IDS[$genome]}"
-    mod_fasta="${id}_mod.fa"
-    bed_file="${id}.bed"
-    cds_file="${id}.cds"
-    if [[ ! -s "$cds_file" ]]; then
-        echo "Generating pseudo-CDS for $id"
-        bedtools getfasta -fi "$mod_fasta" -bed "$bed_file" -name | bioawk -c fastx '{ sub(/::.*/, "", $name); print ">"$name"\n"$seq }' >"$cds_file"
-    else
-        echo "CDS file $cds_file exists. Skipping."
-    fi
-done
-
-# Step 5 - Align pseudo-CDS
+# Step 5 - Anchor proteins between each genome pair
 expected_anchor_files=()
 while read -r line; do
     ID1=$(echo "$line" | awk '{print $1}')
@@ -230,10 +340,13 @@ for anchor_file in "${expected_anchor_files[@]}"; do
 done
 
 if [[ "$anchors_exist" = false ]]; then
-    echo "Step 5 - Align pseudo-CDS"
-    echo "Running: python $BIN_DIR/jcvi_diploid.py -p $PROCESSES --cpus $THREADS"
-    python "$BIN_DIR/jcvi_diploid.py" -p "$PROCESSES" --cpus "$THREADS"
-    rm -f *.nsq *.nin *.nhr *.ndb *.nto *.not *.ntf *.njs *.des *.sds *.tis *.ssp *.bck *.suf *.prj
+    # --prot anchors on the lifted-over peptides via diamond_blastp (--dbtype prot) rather than
+    # on nucleotide pseudo-CDS. '*.dmnd' is the diamond DB jcvi builds; it is cleared alongside
+    # the legacy BLAST/LAST DBs so a failed attempt cannot leave a partial DB behind.
+    echo "Step 5 - Anchor proteins (jcvi --prot, --cscore $CSCORE)"
+    echo "Running: python $BIN_DIR/jcvi_diploid.py -p $PROCESSES --cpus $THREADS --prot --cscore $CSCORE"
+    python "$BIN_DIR/jcvi_diploid.py" -p "$PROCESSES" --cpus "$THREADS" --prot --cscore "$CSCORE"
+    rm -f *.nsq *.nin *.nhr *.ndb *.nto *.not *.ntf *.njs *.des *.sds *.tis *.ssp *.bck *.suf *.prj *.dmnd
 
     # Initialize current processes and threads
     current_p="$PROCESSES"
@@ -270,8 +383,8 @@ if [[ "$anchors_exist" = false ]]; then
 
         echo "Using -p $current_p --cpus $current_cpus"
 
-        python "$BIN_DIR/jcvi_diploid_retry.py" -p "$current_p" --cpus "$current_cpus"
-        rm -f *.nsq *.nin *.nhr *.ndb *.nto *.not *.ntf *.njs *.des *.sds *.tis *.ssp *.bck *.suf *.prj
+        python "$BIN_DIR/jcvi_diploid_retry.py" -p "$current_p" --cpus "$current_cpus" --prot --cscore "$CSCORE"
+        rm -f *.nsq *.nin *.nhr *.ndb *.nto *.not *.ntf *.njs *.des *.sds *.tis *.ssp *.bck *.suf *.prj *.dmnd
     done
 
     # Final check after all attempts
@@ -293,6 +406,14 @@ fi
 
 
 # Steps 6-8 for each pair in jcvi_list.txt
+#
+# Synteny chain, kept in lockstep with synLTR/module1.py step (5):
+#     anchor_builder -> gene_coords_extractor -> subtracter -> subtracter -> consolidator
+#
+# Order matters. The subtracter runs FIRST so that containments are dropped and partial
+# overlaps trimmed; only then does the consolidator merge and stitch. Stitching a gap is
+# only meaningful between blocks that no longer overlap, so consolidating first (the old
+# order) made the inter-anchor gaps ill-defined.
 while read -r line; do
     ID1=$(echo "$line" | awk '{print $1}')
     ID2=$(echo "$line" | awk '{print $2}')
@@ -307,7 +428,10 @@ while read -r line; do
         echo "Cleaned anchor file $clean_anchor_file exists. Skipping."
     fi
 
-    # Step 7 - Convert the cleaned anchor files to coordinate format
+    # Step 7 - Convert the cleaned anchor files to coordinate format.
+    # 'sort | uniq' is load-bearing: anchor_coord_subtracter treats each of two identical
+    # lines as containing the other and removes BOTH, silently deleting the block. Exact
+    # duplicates must never reach it.
     raw_coords_file="${ID1}.${ID2}.anchors.raw.coords"
     if [[ ! -s "$raw_coords_file" ]]; then
         echo "Converting $clean_anchor_file to $raw_coords_file"
@@ -316,38 +440,46 @@ while read -r line; do
         echo "Raw coords file $raw_coords_file exists. Skipping."
     fi
 
-    # Step 8 - Consolidate overlapping anchors
+    # Step 8 - Polish overlapping anchors (two passes), then consolidate and stitch gaps.
+    polished_file="${ID1}.${ID2}.anchors.coords.polished"
+    polished2_file="${ID1}.${ID2}.anchors.coords.polished2"
     coords_file="${ID1}.${ID2}.anchors.coords"
     if [[ ! -s "$coords_file" ]]; then
-        echo "Consolidating $raw_coords_file to $coords_file"
-        python "$BIN_DIR/anchor_coord_consolidator.py" "$raw_coords_file" >"$coords_file"
+        echo "Polishing $raw_coords_file (pass 1 -> $polished_file)"
+        python "$BIN_DIR/anchor_coord_subtracter.py" "$raw_coords_file" "$polished_file"
+
+        # Second pass: the partial-overlap trim mutates records in place while iterating,
+        # so one pass is not guaranteed to reach a fixed point.
+        echo "Polishing $polished_file (pass 2 -> $polished2_file)"
+        python "$BIN_DIR/anchor_coord_subtracter.py" "$polished_file" "$polished2_file"
+
+        echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS)"
+        python "$BIN_DIR/anchor_coord_consolidator.py" "${CONSOLIDATOR_OPTS[@]}" "$polished2_file" >"$coords_file"
     else
         echo "Coords file $coords_file exists. Skipping."
     fi
 
 done <jcvi_list.txt
 
-# Step 9 - Merge the pairwise anchor files
-coords_files=()
-while read -r line; do
-    ID1=$(echo "$line" | awk '{print $1}')
-    ID2=$(echo "$line" | awk '{print $2}')
-    coords_file="${ID1}.${ID2}.anchors.coords"
-    coords_files+=("$coords_file")
-done <jcvi_list.txt
-
-echo "Step 9 - Merge the pairwise anchor files"
-cat "${coords_files[@]}" >all.anchors.coords
-
-# ===== Polish the anchor coordinates by removing overlapping alns =====
+# Step 9 - Merge the pairwise anchor files.
+# Each pair is already polished and consolidated, so the merge is the final product.
+# The subtracter groups by (ref_chrom, query_chrom, strand), and those keys are unique to a
+# pair, so polishing per-pair and merging is equivalent to polishing the merged file -- but
+# it keeps the O(n^2) polish on small per-pair inputs.
 POLISHED="all.anchors.coords.polished"
 if [[ ! -s "$POLISHED" ]]; then
-    echo "Step 9.1 - Polishing merged anchor coordinates"
-    python "$BIN_DIR/anchor_coord_subtracter.py" all.anchors.coords "$POLISHED"
+    coords_files=()
+    while read -r line; do
+        ID1=$(echo "$line" | awk '{print $1}')
+        ID2=$(echo "$line" | awk '{print $2}')
+        coords_files+=("${ID1}.${ID2}.anchors.coords")
+    done <jcvi_list.txt
+
+    echo "Step 9 - Merge the pairwise anchor files"
+    cat "${coords_files[@]}" >"$POLISHED"
 else
-    echo "Polished coords file $POLISHED exists. Skipping."
+    echo "Step 9 - Polished coords file $POLISHED exists. Skipping."
 fi
-# ======================================================================
 
 # Step 10 - Align the genomic anchors
 if [[ ! -s "alignment.paf" ]]; then

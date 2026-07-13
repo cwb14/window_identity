@@ -1,91 +1,215 @@
+#!/usr/bin/env python3
 import sys
+import argparse
 
-def process_file(infile):
+def process_file(infile: str, threshold: int, stitch_gaps: bool):
     """
-    Process the anchors coordinate file to merge lines based on overlapping sequence ranges.
-    The goal is to reduce I/O constraint during the minimap step.
+    Process the anchors coordinate file to merge lines based on overlapping
+    or touching (butt heads) sequence ranges, per (pair1_id, pair2_id, strand) bin.
 
-    Parameters:
-    infile (str): Path to the coordinate file
+    A pair is considered "pass" if both lengths >= threshold; otherwise "fail".
+    Only lines where at least one side is "fail" are eligible to merge.
+    After merging, the merged record's status becomes "pass".
+
+    If --stitch-gaps is set, after merging we insert synthetic lines to fill
+    gaps between consecutive records within each bin (same pair1_id, pair2_id, strand)
+    whenever both sequences have a positive gap. Touching intervals (no gap) are not stitched.
     """
+    # ---------- parsing ----------
     bins = {}
-    merged_lines = []
 
-    # Read the input file and process each line
+    def parse_range(token: str):
+        # e.g., "9311v2_chr1:18291..25404" -> ("9311v2_chr1", 18291, 25404)
+        id_part, coords = token.split(':', 1)
+        start_str, end_str = coords.split('..', 1)
+        return id_part, int(start_str), int(end_str)
+
     with open(infile, 'r') as f:
-        for line in f:
-            # Split the line into components
-            parts = line.strip().split('\t')
-            pair1 = parts[0].split(':')
-            pair1_id = pair1[0]
-            pair1_start, pair1_end = map(int, pair1[1].split('..'))
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) < 3:
+                continue  # Skip malformed lines quietly
 
-            pair2 = parts[1].split(':')
-            pair2_id = pair2[0]
-            pair2_start, pair2_end = map(int, pair2[1].split('..'))
+            pair1_id, pair1_start, pair1_end = parse_range(parts[0])
+            pair2_id, pair2_start, pair2_end = parse_range(parts[1])
+            strand = parts[2].strip()
 
-            strand = parts[2]
-
-            # Calculate lengths
+            # Calculate lengths (half-open style; matches original behavior)
             len1 = pair1_end - pair1_start
             len2 = pair2_end - pair2_start
 
-            # Determine threshold status
-            threshold_status = "pass" if len1 >= 1000000 and len2 >= 1000000 else "fail"
-
-            # Create a bin key based on pair IDs and strand
+            threshold_status = "pass" if (len1 >= threshold and len2 >= threshold) else "fail"
             bin_key = f"{pair1_id}_{pair2_id}_{'plus' if strand == '+' else 'minus'}"
-            new_line = [pair1_id, pair1_start, pair1_end, pair2_id, pair2_start, pair2_end, strand, len1, len2, bin_key, threshold_status]
 
-            # Add the line to the appropriate bin
-            if bin_key not in bins:
-                bins[bin_key] = []
-            bins[bin_key].append(new_line)
+            new_line = [
+                pair1_id, pair1_start, pair1_end,   # 0..2
+                pair2_id, pair2_start, pair2_end,   # 3..5
+                strand,                             # 6
+                len1, len2,                         # 7..8
+                bin_key,                            # 9
+                threshold_status                    # 10
+            ]
+            bins.setdefault(bin_key, []).append(new_line)
 
-    # Merge lines within each bin
+    # ---------- merging ----------
+    def ranges_touch_or_overlap(a_start, a_end, b_start, b_end):
+        # Allow touching: end == start
+        return (a_start <= b_end) and (a_end >= b_start)
+
+    final_bins = {}
+
     for bin_key, lines in bins.items():
+        # Sort to make merging deterministic and efficient
+        lines.sort(key=lambda x: (x[1], x[4]))  # by pair1_start then pair2_start
+        merged_list = []
+
         while lines:
             current_line = lines.pop(0)
             merged = False
 
-            # Check for overlaps and merge lines if possible
             for i, line in enumerate(lines):
-                if (current_line[1] <= line[2] and current_line[2] >= line[1]) and (current_line[4] <= line[5] and current_line[5] >= line[4]):
-                    if current_line[10] == "fail" or line[10] == "fail":
-                        merged_line = [
-                            current_line[0],
-                            min(current_line[1], line[1]),
-                            max(current_line[2], line[2]),
-                            current_line[3],
-                            min(current_line[4], line[4]),
-                            max(current_line[5], line[5]),
-                            current_line[6],
-                            min(current_line[7], line[7]),
-                            max(current_line[8], line[8]),
-                            current_line[9],
-                            "pass"  # Set the merged threshold_status to "pass"
-                        ]
-                        lines[i] = merged_line
-                        merged = True
-                        break
+                cond1 = ranges_touch_or_overlap(current_line[1], current_line[2], line[1], line[2])
+                cond2 = ranges_touch_or_overlap(current_line[4], current_line[5], line[4], line[5])
+
+                # Merge if both sequences overlap or touch AND at least one record is "fail"
+                if cond1 and cond2 and (current_line[10] == "fail" or line[10] == "fail"):
+                    merged_line = [
+                        current_line[0],
+                        min(current_line[1], line[1]),
+                        max(current_line[2], line[2]),
+                        current_line[3],
+                        min(current_line[4], line[4]),
+                        max(current_line[5], line[5]),
+                        current_line[6],
+                        # these len fields aren’t used for output, but keep them coherent
+                        max(current_line[2], line[2]) - min(current_line[1], line[1]),
+                        max(current_line[5], line[5]) - min(current_line[4], line[4]),
+                        current_line[9],
+                        "pass"  # merged becomes pass
+                    ]
+                    lines[i] = merged_line
+                    merged = True
+                    break
 
             if not merged:
-                merged_lines.append(current_line)
+                merged_list.append(current_line)
 
-    # Output the merged lines in the original format
-    for line in merged_lines:
-        print(f"{line[0]}:{line[1]}..{line[2]}\t{line[3]}:{line[4]}..{line[5]}\t{line[6]}")
+        # Keep per-bin results for optional stitching
+        final_bins[bin_key] = merged_list
+
+    # ---------- optional stitching ----------
+    if stitch_gaps:
+        from collections import defaultdict
+
+        # Index all records per (pair1_id, pair2_id) across BOTH strands (for opposite-strand guard)
+        pair_index = defaultdict(list)
+        for _bin_key, _lines in final_bins.items():
+            for rec in _lines:
+                pair_index[(rec[0], rec[3])].append(rec)
+
+        def has_opposite_strand_between(prev, nxt):
+            # Gap windows on both sequences
+            gap1_start, gap1_end = prev[2], nxt[1]
+            gap2_start, gap2_end = prev[5], nxt[4]
+            if not (gap1_end > gap1_start and gap2_end > gap2_start):
+                return False  # nothing to check
+
+            for cand in pair_index[(prev[0], prev[3])]:
+                if cand is prev or cand is nxt:
+                    continue
+                # only consider opposite strand
+                if cand[6] == prev[6]:
+                    continue
+                # if an opposite-strand block overlaps BOTH gap windows, it "occupies" the gap
+                if (cand[1] <= gap1_end and cand[2] >= gap1_start) and \
+                   (cand[4] <= gap2_end and cand[5] >= gap2_start):
+                    return True
+            return False
+
+        for bin_key, lines in final_bins.items():
+            if not lines:
+                continue
+
+            # Build dual orderings within THIS bin (same pair1_id, pair2_id, strand)
+            lines_by_p1 = sorted(lines, key=lambda x: (x[1], x[4]))  # pair1_start then pair2_start
+            lines_by_p2 = sorted(lines, key=lambda x: (x[4], x[1]))  # pair2_start then pair1_start
+
+            # Map "identity" of a record to its index in pair2-order for quick adjacency checks
+            pos_in_p2 = {id(rec): idx for idx, rec in enumerate(lines_by_p2)}
+
+            stitched = []
+            for prev, nxt in zip(lines_by_p1, lines_by_p1[1:]):
+                stitched.append(prev)
+
+                # Positive gaps on both sequences?
+                gap1_start, gap1_end = prev[2], nxt[1]
+                gap2_start, gap2_end = prev[5], nxt[4]
+                if not (gap1_end > gap1_start and gap2_end > gap2_start):
+                    continue  # no stitch for touching/overlapping
+
+                # NEW GUARD #1: Opposite strand occupying the gap → skip
+                if has_opposite_strand_between(prev, nxt):
+                    continue
+
+                # NEW GUARD #2: Dual-order adjacency check
+                j = pos_in_p2[id(prev)]
+                k = pos_in_p2[id(nxt)]
+                if abs(j - k) != 1:
+                    # Not consecutive in pair2 order → bogus stitch, skip
+                    continue
+
+                # If both guards pass, insert the synthetic line
+                stitched.append([
+                    prev[0], gap1_start, gap1_end,
+                    prev[3], gap2_start, gap2_end,
+                    prev[6],
+                    gap1_end - gap1_start,
+                    gap2_end - gap2_start,
+                    bin_key,
+                    "stitched"  # internal marker; output format ignores this
+                ])
+
+            # append the last original record (in pair1 order)
+            stitched.append(lines_by_p1[-1])
+
+            # Keep stitched list sorted for deterministic output
+            final_bins[bin_key] = sorted(stitched, key=lambda x: (x[1], x[4]))
+
+    # ---------- output ----------
+    # Flatten bins in insertion order; within bin keep sorted order for determinism
+    for bin_key in final_bins:
+        for line in sorted(final_bins[bin_key], key=lambda x: (x[1], x[4])):
+            print(f"{line[0]}:{line[1]}..{line[2]}\t{line[3]}:{line[4]}..{line[5]}\t{line[6]}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merge anchor coordinate lines by overlapping/touching ranges within (pair1_id, pair2_id, strand) bins, with optional gap stitching."
+    )
+    parser.add_argument(
+        "infile",
+        help="Path to the input anchors coordinate file (e.g., all.recip.anchors.coords)"
+    )
+    parser.add_argument(
+        "-t", "--threshold",
+        type=int,
+        default=1_000_000,
+        help="Length threshold for each side to be considered 'pass' (default: 1000000)"
+    )
+    parser.add_argument(
+        "--stitch-gaps",
+        action="store_true",
+        help="After merging, insert synthetic lines to fill positive gaps between consecutive records within each (pair1, pair2, strand) bin."
+    )
+    args = parser.parse_args()
+
+    if args.threshold < 0:
+        print("Threshold must be non-negative.", file=sys.stderr)
+        sys.exit(2)
+
+    process_file(args.infile, args.threshold, args.stitch_gaps)
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python anchor_coord_consolidator.py all.recip.anchors.coords > outfile\n")
-        print("This script processes the input file to merge lines based on overlapping coordinate ranges")
-        print("Parameters:")
-        print("infile : Path to the input file")
-        print("outfile: Path to the output file (use redirection to specify the output file)\n")
-        print("Example:")
-        print("python script.py infile > outfile")
-        sys.exit(1)
-
-    infile = sys.argv[1]
-    process_file(infile)
+    main()
