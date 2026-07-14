@@ -16,6 +16,10 @@ from fastaio import fasta_stem, open_fasta
 # Helpers for chr parsing/naming
 # -----------------------------
 
+# Max length of a generated 'scaN' sequence name, excluding the leading '>'.
+# Scaffolds whose renamed header exceeds this are excluded; chr headers are exempt.
+MAX_SCA_NAME_LEN = 13
+
 CHR_PREFIX_RE = re.compile(
     r'(Chr|chr|Chro|chro|Chrom|chrom|Chromosome|chromosome|CHROMOSOME|CHR|CHRO|CHROM)'
     r'[ _-]*:? ?'                       # optional separators/colon
@@ -64,6 +68,59 @@ def make_chr_header(prefix: str, chrom: str, letter: str | None) -> str:
 # -----------------------------
 # Core processing
 # -----------------------------
+
+def preflight_file(file_path):
+    """Will process_file() emit at least one sequence for this genome?
+
+    Streams headers only (never the sequence body) so the whole check costs seconds even on
+    a multi-GB assembly. Deliberately reuses CHR_PREFIX_RE / MAX_SCA_NAME_LEN rather than
+    re-stating the rule, so this can never drift from the real code path.
+
+    Returns (ok, message).
+    """
+    if not os.path.isfile(file_path):
+        return False, f"{file_path}: genome file not found."
+
+    stem = fasta_stem(file_path)
+    # Scaffolds are numbered from 1, so '{stem}_sca1' is the shortest name we would ever emit.
+    # If even that fits, some sequence is guaranteed to survive and we can stop at the first record.
+    sca_fits = len(f"{stem}_sca1") <= MAX_SCA_NAME_LEN
+
+    n_headers = 0
+    has_chr = False
+    with open_fasta(file_path) as fasta_file:
+        for line in fasta_file:
+            if not line.startswith('>'):
+                continue
+            n_headers += 1
+            if sca_fits:
+                break  # first record already proves the output is non-empty
+            if parse_chr_from_header(line.strip())[0] is not None:
+                has_chr = True
+                break  # a chr-like header is exempt from the length rule
+
+    if n_headers == 0:
+        return False, f"{file_path}: no FASTA records found."
+    if has_chr or sca_fits:
+        return True, ""
+
+    # Every sequence is scaffold-like and every '{stem}_scaN' name is too long.
+    budget = MAX_SCA_NAME_LEN - len("_sca") - len(str(n_headers))
+    short = os.path.basename(file_path).split('.')[0][:max(budget, 1)]
+    directory = os.path.dirname(file_path) or "."
+    return False, (
+        f"{file_path}: none of its {n_headers} sequences would survive renaming, so it would "
+        f"produce an empty genome.\n"
+        f"    Cause: no chromosome-style headers (Chr1, chr1, ...), so all {n_headers} sequences "
+        f"are treated as scaffolds and renamed '{stem}_scaN' -- but that exceeds the "
+        f"{MAX_SCA_NAME_LEN}-char name limit.\n"
+        f"    The stem comes from the filename: '{stem}' is {len(stem)} chars, but "
+        f"{n_headers} sequences leave room for only {budget}.\n"
+        f"    Fix: point the run at a shorter-named symlink, e.g.\n"
+        f"      ln -sfn {os.path.basename(file_path)} {directory}/{short}.fa\n"
+        f"    then pass {directory}/{short}.fa instead."
+    )
+
 
 def process_file(file_path, pass_files, out_dir, out_suffix):
     file_prefix = fasta_stem(file_path)
@@ -207,25 +264,42 @@ def process_file(file_path, pass_files, out_dir, out_suffix):
     # Handle non-chr (sca) sequences
     # -----------------------------
     fallback_counter = 1
+    sca_written = 0
     for header, seqs in sorted_sca_sequences:
         # ensure unique sca header
         while f'>{file_prefix}_sca{fallback_counter}' in used_headers:
             fallback_counter += 1
         new_header_full = f'>{file_prefix}_sca{fallback_counter}'
         # Historical constraint: exclude overly long 'sca' headers; chr headers are exempt
-        if len(new_header_full) > 14:
-            print(f"Excluding sequence with header {new_header_full} due to length > 13 characters.")
+        if len(new_header_full) - 1 > MAX_SCA_NAME_LEN:
+            print(f"Excluding sequence with header {new_header_full} due to length > {MAX_SCA_NAME_LEN} characters.")
             break
         old_header_no_gt = header.strip()[1:]
         new_lines.append(f'{new_header_full}\n')
         used_headers.add(new_header_full)
         fallback_counter += 1
+        sca_written += 1
         header_mapping.append(f'{old_header_no_gt}\t{new_header_full[1:]}\n')
         new_lines.append(''.join(seqs) + '\n')
 
     # -----------------------------
     # Pipe through bioawk for clean FASTA formatting
     # -----------------------------
+    # bioawk segfaults (SIGSEGV, reported as returncode -11) on empty stdin, so an
+    # all-sequences-dropped filter result must be caught here or it surfaces as a crash.
+    if not new_lines:
+        n_dropped_sca = len(sorted_sca_sequences) - sca_written
+        raise RuntimeError(
+            f"No sequences survived filtering for {file_path}: all {len(sequences)} input "
+            f"sequences were dropped ({len(chr_sequences)} chromosome-like, "
+            f"{len(sca_sequences)} scaffold-like, of which {n_dropped_sca} were dropped on the "
+            f"header-length rule). Scaffolds are renamed '{file_prefix}_scaN', which is dropped "
+            f"when it exceeds {MAX_SCA_NAME_LEN} characters -- the stem '{file_prefix}' "
+            f"({len(file_prefix)} chars) leaves no room. Use a shorter filename stem (a symlink "
+            f"is enough) or give the assembly chromosome-style headers (Chr1, chr1, ...) so its "
+            f"sequences are not treated as scaffolds."
+        )
+
     bioawk_command = ["bioawk", "-c", "fastx", '{print ">"$name; print $seq}']
     try:
         process = subprocess.Popen(
@@ -325,6 +399,24 @@ def write_prefix_list(filename, prefixes, out_dir):
     print(f"Wrote {path}")
 
 
+def run_preflight(genomes):
+    """Validate every genome up front. Returns the number that failed."""
+    failures = []
+    for genome_file in genomes:
+        ok, msg = preflight_file(genome_file)
+        if not ok:
+            failures.append(msg)
+
+    if failures:
+        print(
+            f"\n[FATAL] {len(failures)} of {len(genomes)} genome(s) cannot be processed:\n",
+            file=sys.stderr,
+        )
+        for msg in failures:
+            print(f"  - {msg}\n", file=sys.stderr)
+    return len(failures)
+
+
 def main(genomes, pass_files, processes, out_dir, out_suffix):
     # Safety: disallow disabling suffix unless writing to a separate output directory
     if out_suffix == "disable" and not out_dir:
@@ -332,6 +424,12 @@ def main(genomes, pass_files, processes, out_dir, out_suffix):
             "[FATAL] -out_suffix disable is only allowed when writing to a separate directory via -out_dir. "
             "Otherwise output could overwrite input."
         )
+
+    # Check every genome before processing any of them. Without this, a bad genome is only
+    # discovered after the good ones have already been renamed, and the caller is left with a
+    # half-populated directory that looks like a successful run.
+    if run_preflight(genomes):
+        raise SystemExit(1)
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -361,9 +459,12 @@ def main(genomes, pass_files, processes, out_dir, out_suffix):
     write_prefix_list('pass_list.txt', pass_prefixes, out_dir)
 
     if errors:
-        print("\nThe following genomes failed to process:")
+        # Exit non-zero: a missing *_mod.fa here becomes an opaque "failed to open/build
+        # the index" crash in the downstream liftover, so stop the pipeline at the source.
+        print("\nThe following genomes failed to process:", file=sys.stderr)
         for gf, msg in errors:
-            print(f" - {gf}: {msg}")
+            print(f" - {gf}: {msg}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
@@ -393,5 +494,17 @@ if __name__ == "__main__":
         )
     )
 
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Only check that each genome would yield at least one renamed sequence, then exit "
+            "(0 = all usable, 1 = at least one unusable). Reads headers only, so it is cheap "
+            "enough to run before any expensive downstream step."
+        )
+    )
+
     args = parser.parse_args()
+    if args.preflight:
+        raise SystemExit(1 if run_preflight(args.genomes) else 0)
     main(args.genomes, args.pass_files, args.processes, args.out_dir, args.out_suffix)

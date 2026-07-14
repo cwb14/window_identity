@@ -18,10 +18,10 @@ REF=""
 QUERY_GENOMES=()
 # Divergence mapping option for synmap.py
 X_TYPE="asm10"
-# Protein liftover (Steps 2-4) and anchoring (Step 5). Defaults match synLTR/module1.py.
-OUTN=1
+# Protein liftover (Steps 2-4) and anchoring (Step 5).
+OUTN=10
 OUTS=0.95
-OUTC=0.9
+OUTC=0.1
 TESORTER="yes"
 CSCORE=0.99
 # Synteny block consolidation (see Steps 6-9). Defaults match synLTR/module1.py.
@@ -292,6 +292,14 @@ if [[ ${#_dupe_ids[@]} -gt 0 ]]; then
     exit 1
 fi
 
+# A genome whose sequences would all be dropped by the renamer yields an empty *_mod.fa, which
+# only surfaces much later as an opaque miniprot "failed to open/build the index". Catch it here,
+# before cd-hit/TEsorter/miniprot spend CPU on a run that is already doomed. Reads headers only.
+if ! python "$BIN_DIR/fasta_renamer_diploid.py" --preflight -genomes "${ALL_GENOMES[@]}"; then
+    echo "Aborting before Step 1: no work has been done. Fix the input(s) above and re-run." >&2
+    exit 1
+fi
+
 
 # Step 1 - Cleanup the input genome file
 modified_fastas_exist=true
@@ -310,7 +318,10 @@ fi
 if [[ "$modified_fastas_exist" = false ]]; then
     echo "Step 1 - Cleanup the input genome file."
     echo "Running: python $BIN_DIR/fasta_renamer_diploid.py -genomes ${ALL_GENOMES[@]}"
-    python "$BIN_DIR/fasta_renamer_diploid.py" -genomes "${ALL_GENOMES[@]}"
+    if ! python "$BIN_DIR/fasta_renamer_diploid.py" -genomes "${ALL_GENOMES[@]}"; then
+        echo "Error: Step 1 (fasta_renamer_diploid.py) failed. Aborting before the liftover." >&2
+        exit 1
+    fi
 else
     echo "Step 1 - Modified fasta files and jcvi_list.txt exist. Skipping."
 fi
