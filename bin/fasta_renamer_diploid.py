@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import re
 import os
+import sys
 import subprocess
 from argparse import ArgumentParser
 from itertools import combinations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict, Counter
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from fastaio import fasta_stem, open_fasta
 
 
 # -----------------------------
@@ -62,23 +66,22 @@ def make_chr_header(prefix: str, chrom: str, letter: str | None) -> str:
 # -----------------------------
 
 def process_file(file_path, pass_files, out_dir, out_suffix):
-    file_prefix = os.path.splitext(os.path.basename(file_path))[0]
+    file_prefix = fasta_stem(file_path)
     if not os.path.isfile(file_path):
         print(f"[ERROR] Genome file not found: {file_path}")
         return
 
-    with open(file_path, 'r') as fasta_file:
-        lines = fasta_file.readlines()
-
-    # Parse FASTA
+    # Stream the records in. open_fasta decompresses .gz/.bz2/.xz transparently, so a
+    # '.fa.gz' assembly downloaded straight from NCBI or Ensembl needs no pre-step.
     sequences = {}
     current_header = None
-    for line in lines:
-        if line.startswith('>'):
-            current_header = line.strip()
-            sequences[current_header] = []
-        elif current_header:
-            sequences[current_header].append(line.strip())
+    with open_fasta(file_path) as fasta_file:
+        for line in fasta_file:
+            if line.startswith('>'):
+                current_header = line.strip()
+                sequences[current_header] = []
+            elif current_header:
+                sequences[current_header].append(line.strip())
 
     sequence_lengths = {header: sum(len(seq) for seq in seqs) for header, seqs in sequences.items()}
 
@@ -333,7 +336,7 @@ def main(genomes, pass_files, processes, out_dir, out_suffix):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    genome_prefixes = [os.path.splitext(os.path.basename(genome))[0] for genome in genomes]
+    genome_prefixes = [fasta_stem(genome) for genome in genomes]
     pass_prefixes = [os.path.splitext(os.path.splitext(os.path.basename(pass_file))[0])[0] for pass_file in pass_files]
 
     errors = []

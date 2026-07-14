@@ -33,6 +33,10 @@ usage() {
     cat << EOF
 Usage: $(basename "$0") -ref REF_GENOME -query GENOME1 [GENOME2 ...] [options]
 
+FASTA inputs (-ref, -query, -peptide) may be plain or compressed with gzip/bgzip
+(.gz/.bgz/.bgzf), bzip2 (.bz2), or xz (.xz/.lzma). The genome ID is the filename
+minus those suffixes and the FASTA suffix, so 'Psupina.fa.gz' -> 'Psupina'.
+
 Required:
   -ref GENOME                  Reference genome
   -query GENOME [GENOME ...]   Query genome(s)
@@ -58,6 +62,9 @@ Options:
                                two-pass TEsorter + blastp screen (default: $TESORTER). TE
                                proteins seed false anchors genome-wide; leave this on unless
                                you are certain the proteome is already TE-free. Slow.
+                               A proteome with no detectable TEs (curated reference
+                               annotations are usually already TE-filtered) passes through
+                               unchanged -- the screen reports 0 removed and continues.
   -cscore FLOAT                jcvi --cscore (default: $CSCORE). ~0.99 is RBH-like; lower it
                                for polyploids.
   -min_block_size N            Anchor blocks with BOTH sides >= N are kept as-is; smaller
@@ -236,13 +243,54 @@ fi
 # Collect all genomes (reference and query)
 ALL_GENOMES=("$REF" "${QUERY_GENOMES[@]}")
 
+# Derive a genome ID from a path: basename, minus one compression suffix, minus one
+# FASTA suffix. MUST stay in lockstep with fasta_stem() in bin/fastaio.py -- the shell
+# names the files ('{id}_mod.fa', '{id}.pep', the anchor chain) that the Python steps
+# write, so a disagreement means the pipeline looks for outputs that exist under
+# another name. Only known suffixes are stripped, so 'Poa.annua.v2.fa.gz' keeps its
+# dots and yields 'Poa.annua.v2'.
+fasta_stem() {
+    local f
+    f=$(basename "$1")
+    case "$f" in
+        *.gz|*.bgz|*.bgzf|*.bz2|*.xz|*.lzma) f="${f%.*}" ;;
+    esac
+    case "$f" in
+        *.fa|*.fas|*.fasta|*.fna|*.ffn|*.faa|*.mfa|*.pep|*.seq) f="${f%.*}" ;;
+    esac
+    printf '%s' "$f"
+}
+
+# Validate the genomes before doing anything expensive. gzip/bzip2/xz inputs are read
+# directly by Step 1; anything else compressed must be decompressed by hand first.
+for genome in "${ALL_GENOMES[@]}"; do
+    if [[ ! -s "$genome" ]]; then
+        echo "Error: genome not found or empty: $genome"
+        exit 1
+    fi
+    case "$genome" in
+        *.zst|*.zstd|*.bz|*.lz4|*.Z|*.zip)
+            echo "Error: unsupported compression for $genome."
+            echo "       Supported: plain, .gz/.bgz/.bgzf, .bz2, .xz/.lzma. Decompress it and re-run."
+            exit 1
+            ;;
+    esac
+done
+
 # Extract genome IDs
 declare -A GENOME_IDS
 for genome in "${ALL_GENOMES[@]}"; do
-    filename=$(basename "$genome")
-    id="${filename%%.*}"
-    GENOME_IDS["$genome"]="$id"
+    GENOME_IDS["$genome"]=$(fasta_stem "$genome")
 done
+
+# Two inputs whose IDs collide would silently overwrite each other's outputs.
+mapfile -t _sorted_ids < <(printf '%s\n' "${GENOME_IDS[@]}" | sort)
+mapfile -t _dupe_ids < <(printf '%s\n' "${_sorted_ids[@]}" | uniq -d)
+if [[ ${#_dupe_ids[@]} -gt 0 ]]; then
+    echo "Error: duplicate genome ID(s): ${_dupe_ids[*]}"
+    echo "       Genome IDs come from the filename; give the inputs distinct names."
+    exit 1
+fi
 
 
 # Step 1 - Cleanup the input genome file
@@ -527,8 +575,8 @@ else
 fi
 
 # Step 12 - Subset the alignment file according to the reference
+# GENOME_IDS already holds the stem; do not strip again, or a dotted ID loses its tail.
 REF_ID="${GENOME_IDS[$REF]}"
-REF_ID="${REF_ID%%.*}"
 
 subset_pafs_exist=true
 for genome in "${QUERY_GENOMES[@]}"; do

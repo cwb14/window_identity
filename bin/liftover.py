@@ -8,6 +8,9 @@ import tempfile
 import shutil
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from fastaio import fasta_stem, is_compressed, materialize_plain
+
 # python liftover.py --genome Bdhap.fa Cdact.fa Eindi.fa --reference Sbico.pep --outn 1 --outs 0.99 --outc 0.9 --threads 20
 #
 # Two approaches to generate CDS (1: concatenating 'CDS' feature from gff; 2: Using the '##ATN' sequence).
@@ -319,70 +322,163 @@ def run_cdhit_on_proteins(reference_fa):
     subprocess.check_call(["cd-hit", "-i", reference_fa, "-o", cleaned])
     return cleaned  # without extension: cd-hit creates exactly this file
 
+def count_fasta_records(path):
+    """Number of '>' headers in a FASTA, or 0 if it is missing/empty."""
+    if not path or not os.path.exists(path):
+        return 0
+    n = 0
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                n += 1
+    return n
+
+
+def copy_fasta(src, dst):
+    """Materialise dst as a copy of src (used when a filtering pass is a no-op)."""
+    shutil.copyfile(src, dst)
+    return dst
+
+
+def seqkit_exclude(ids_file, in_fa, out_fa):
+    """
+    Drop the sequences named in ids_file from in_fa, writing out_fa.
+
+    An empty ids_file means 'exclude nothing'. seqkit would technically do the right
+    thing there (it warns '0 patterns loaded' and passes everything through), but
+    calling it is pointless and the warning reads like a failure. Copy instead.
+    """
+    if os.path.getsize(ids_file) == 0:
+        return copy_fasta(in_fa, out_fa)
+    with open(out_fa, "w") as out:
+        subprocess.check_call(["seqkit", "grep", "-v", "-f", ids_file, in_fa], stdout=out)
+    return out_fa
+
+
 def run_tesorter_two_pass(protein_fa, threads):
     """
-    Implements the two-pass TEsorter → BLASTP workflow described by the user.
-    All artifacts are written to CWD using the basename of protein_fa as prefix.
-    Returns the final cleaned FASTA path: {base}_no_TEs.faa
+    Two-pass TE screen of the reference proteome: TEsorter (HMM) then BLASTP against
+    the TE peptides TEsorter found. Artifacts land in CWD, prefixed by the basename
+    of protein_fa. Returns (path to the cleaned FASTA, artifact manifest).
+
+    A proteome with no detectable TEs is a normal outcome, not an error. Curated
+    reference annotations (Ensembl's Amborella pep.all, for one) are already
+    TE-filtered upstream, so TEsorter classifies nothing and the '.rexdb.cls.pep'
+    it writes is legitimately empty. Both passes below degrade to no-ops in that
+    case: an empty TE set means there is nothing to build a BLAST DB from and
+    nothing to remove, so the proteome passes through unchanged. Feeding the empty
+    file to makeblastdb is what used to abort the run.
     """
-    base_name = os.path.basename(protein_fa)        # e.g., Sbico.pep or Sbico.pep.cdhit
-    base_root, _ = os.path.splitext(base_name)      # Sbico or Sbico.pep
-    prefix = base_name                              # Keep the dot; matches user's examples
+    prefix = os.path.basename(protein_fa)  # e.g. Sbico.pep.cdhit -- keep the dots
 
-    # 1) TEsorter (protein mode)
-    print(f"Running: TEsorter {protein_fa} -st prot -p {threads}", file=sys.stderr)
-    subprocess.check_call(["TEsorter", protein_fa, "-st", "prot", "-p", str(threads)])
-
-    # Files produced by TEsorter (prefix comes from input filename)
+    final_no_tes = f"{prefix}_no_TEs.faa"
+    rnd1 = f"{prefix}_rnd1.TE_peps.faa"
+    te_list = f"{prefix}.TE_peps.list"
+    ids_for_seqkit = f"{prefix}.TE_peps.ids"
+    dummy_faa = f"{prefix}.TE_peptides.dummy.faa"
+    rnd2_list = f"{prefix}.rnd2.TE_peps.list"
+    rnd2_ids = f"{prefix}.rnd2.TE_peps.ids"
     cls_tsv = f"{prefix}.rexdb.cls.tsv"
     cls_pep = f"{prefix}.rexdb.cls.pep"
-
-    # 2) First pass list: first column of cls.tsv, dropping comment lines and leading '>'
-    te_list = f"{prefix}.TE_peps.list"
-    ids_for_seqkit = f"{prefix}.TE_peps.ids"  # cleaned IDs without '>'
-
-    with open(te_list, "w") as out_list, open(ids_for_seqkit, "w") as out_ids:
-        with open(cls_tsv) as inp:
-            for line in inp:
-                if line.startswith("#") or not line.strip():
-                    continue
-                first = line.split("\t", 1)[0].strip()
-                out_list.write(first + "\n")
-                if first.startswith(">"):
-                    first = first[1:]
-                out_ids.write(first + "\n")
-
-    # 3) Remove TE-labelled peptides (first pass)
-    rnd1 = f"{prefix}_rnd1.TE_peps.faa"
-    print(f"Removing TE peptides (pass1) → {rnd1}", file=sys.stderr)
-    subprocess.check_call([
-        "seqkit", "grep", "-v", "-f", ids_for_seqkit, protein_fa
-    ], stdout=open(rnd1, "w"))
-
-    # 4) Build dummy DB from TEsorter peptide output
-    dummy_faa = f"{prefix}.TE_peptides.dummy.faa"
-    print(f"Building dummy TE peptide DB input → {dummy_faa}", file=sys.stderr)
-    with open(dummy_faa, "w") as out:
-        i = 0
-        with open(cls_pep) as inp:
-            for line in inp:
-                if line.startswith(">"):
-                    i += 1
-                    out.write(f">TE{i}\n")
-                else:
-                    out.write(line)
-
     db_dir = "db"
-    os.makedirs(db_dir, exist_ok=True)
     db_prefix = os.path.join(db_dir, "TEpep")
+
+    artifacts = {
+        "keep_if_outputs_TEsorter": [
+            final_no_tes, rnd2_list, db_dir, dummy_faa, rnd1, te_list,
+            cls_pep,
+            f"{prefix}.rexdb.cls.lib",
+            cls_tsv,
+            f"{prefix}.rexdb.dom.tsv",
+            f"{prefix}.rexdb.dom.faa",
+            f"{prefix}.rexdb.dom.gff3",
+            f"{prefix}.rexdb.domtbl",
+        ],
+        "extra_tmp": [ids_for_seqkit, rnd2_ids],
+    }
+
+    n_in = count_fasta_records(protein_fa)
+
+    # Resume on the finished product only. Intermediates are not a safe resume point:
+    # TEsorter reuses an existing '.domtbl' and skips hmmscan whenever the file is
+    # merely non-empty, so a truncated domtbl from a killed run would silently
+    # under-call TEs. '-fw' below forces the scan; this check is what keeps a
+    # completed run from paying for it twice.
+    if os.path.exists(final_no_tes) and os.path.getsize(final_no_tes) > 0:
+        print(f"TE screen: reusing existing {final_no_tes} "
+              f"({count_fasta_records(final_no_tes)} peptides).", file=sys.stderr)
+        return final_no_tes, artifacts
+
+    # 1) TEsorter (protein mode)
+    print(f"Running: TEsorter {protein_fa} -st prot -p {threads} -fw", file=sys.stderr)
+    subprocess.check_call(["TEsorter", protein_fa, "-st", "prot", "-p", str(threads), "-fw"])
+
+    # 2) First pass list: first column of cls.tsv, minus comments and any leading '>'.
+    #    TEsorter still writes cls.tsv when it classifies nothing, but do not depend on it.
+    with open(te_list, "w") as out_list, open(ids_for_seqkit, "w") as out_ids:
+        if os.path.exists(cls_tsv):
+            with open(cls_tsv) as inp:
+                for line in inp:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    first = line.split("\t", 1)[0].strip()
+                    out_list.write(first + "\n")
+                    out_ids.write(first.lstrip(">") + "\n")
+
+    with open(ids_for_seqkit) as fh:
+        n_hmm = sum(1 for _ in fh)
+
+    # 3) Remove HMM-labelled TE peptides (pass 1)
+    print(f"Removing TE peptides (pass1, {n_hmm} hit) → {rnd1}", file=sys.stderr)
+    seqkit_exclude(ids_for_seqkit, protein_fa, rnd1)
+
+    # 4) Build the TE peptide BLAST DB from TEsorter's classified domains.
+    #    With nothing classified there is no DB to build and no second pass to run.
+    n_te_pep = count_fasta_records(cls_pep)
+    if n_te_pep == 0:
+        print(
+            "TE screen: TEsorter classified 0 peptides as TE-derived, so the BLASTP "
+            "second pass has no database to search and is skipped. The proteome is "
+            "passed through unchanged. This is expected for curated reference "
+            "proteomes that were already TE-filtered by their annotation pipeline; "
+            "if you expected TEs here, check that the TEsorter database matches the "
+            "clade (-db rexdb-plant for plants).",
+            file=sys.stderr,
+        )
+        open(dummy_faa, "w").close()
+        open(rnd2_list, "w").close()
+        open(rnd2_ids, "w").close()
+        copy_fasta(rnd1, final_no_tes)
+        print(f"TE screen: {n_in} in → {n_in} out (0 removed).", file=sys.stderr)
+        return final_no_tes, artifacts
+
+    # Every peptide being a TE means the screen ate the proteome. miniprot would then
+    # align nothing and the pipeline would fail several expensive steps later, so stop here.
+    if count_fasta_records(rnd1) == 0:
+        raise SystemExit(
+            f"[FATAL] The TE screen removed all {n_in} reference peptides "
+            f"({protein_fa}). Nothing is left to lift over. Check that the reference "
+            f"is a proteome (not a TE library) and that the TEsorter database is right."
+        )
+
+    print(f"Building dummy TE peptide DB input ({n_te_pep} peptides) → {dummy_faa}", file=sys.stderr)
+    with open(dummy_faa, "w") as out, open(cls_pep) as inp:
+        i = 0
+        for line in inp:
+            if line.startswith(">"):
+                i += 1
+                out.write(f">TE{i}\n")
+            else:
+                out.write(line)
+
+    os.makedirs(db_dir, exist_ok=True)
     print(f"makeblastdb -in {dummy_faa} -dbtype prot -parse_seqids -title TEpep -out {db_prefix}", file=sys.stderr)
     subprocess.check_call([
         "makeblastdb", "-in", dummy_faa, "-dbtype", "prot",
         "-parse_seqids", "-title", "TEpep", "-out", db_prefix
     ])
 
-    # 5) blastp second pass
-    rnd2_list = f"{prefix}.rnd2.TE_peps.list"
+    # 5) blastp second pass: catch TE peptides the HMMs missed but that resemble the ones they caught.
     print(f"BLASTP second pass → {rnd2_list}", file=sys.stderr)
     with open(rnd2_list, "w") as out:
         subprocess.check_call([
@@ -397,39 +493,31 @@ def run_tesorter_two_pass(protein_fa, threads):
             "-num_threads", str(threads)
         ], stdout=out)
 
-    # Extract first column (qseqid) and remove them from rnd1 to produce final non-TE set
-    rnd2_ids = f"{prefix}.rnd2.TE_peps.ids"
-    with open(rnd2_ids, "w") as out:
-        with open(rnd2_list) as inp:
-            for line in inp:
-                if not line.strip():
-                    continue
-                out.write(line.split("\t", 1)[0].strip() + "\n")
+    # Unique qseqids -> the peptides to drop. No hits is fine: nothing to drop.
+    seen = set()
+    with open(rnd2_ids, "w") as out, open(rnd2_list) as inp:
+        for line in inp:
+            if not line.strip():
+                continue
+            qid = line.split("\t", 1)[0].strip()
+            if qid not in seen:
+                seen.add(qid)
+                out.write(qid + "\n")
 
-    final_no_tes = f"{prefix}_no_TEs.faa"
-    print(f"Removing BLAST-matched TE peptides (pass2) → {final_no_tes}", file=sys.stderr)
-    subprocess.check_call([
-        "seqkit", "grep", "-v", "-f", rnd2_ids, rnd1
-    ], stdout=open(final_no_tes, "w"))
+    print(f"Removing BLAST-matched TE peptides (pass2, {len(seen)} hit) → {final_no_tes}", file=sys.stderr)
+    seqkit_exclude(rnd2_ids, rnd1, final_no_tes)
 
-    return final_no_tes, {
-        "keep_if_outputs_TEsorter": [
-            final_no_tes,
-            rnd2_list,
-            db_dir,
-            dummy_faa,
-            rnd1,
-            te_list,
-            f"{prefix}.rexdb.cls.pep",
-            f"{prefix}.rexdb.cls.lib",
-            f"{prefix}.rexdb.cls.tsv",
-            f"{prefix}.rexdb.dom.tsv",
-            f"{prefix}.rexdb.dom.faa",
-            f"{prefix}.rexdb.dom.gff3",
-            f"{prefix}.rexdb.domtbl",
-        ],
-        "extra_tmp": [ids_for_seqkit, rnd2_ids],  # always safe to delete later
-    }
+    n_out = count_fasta_records(final_no_tes)
+    if n_out == 0:
+        raise SystemExit(
+            f"[FATAL] The TE screen removed all {n_in} reference peptides "
+            f"({protein_fa}). Nothing is left to lift over."
+        )
+    print(f"TE screen: {n_in} in → {n_out} out "
+          f"({n_hmm} removed by HMM, {len(seen)} by BLASTP).", file=sys.stderr)
+
+    return final_no_tes, artifacts
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -467,14 +555,23 @@ def main():
     default_outputs = {"gff", "pep", "bed", "fai", "mRNA", "cds", "inframe", "cdhit"}
     want = set(args.outputs) if args.outputs else default_outputs
 
+    # Compressed inputs: cd-hit, TEsorter, makeblastdb, samtools faidx and bedtools
+    # getfasta all read plain FASTA only, so decompress once up front rather than
+    # teaching each call site. Uncompressed inputs are passed through untouched.
+    def _log(msg):
+        print(msg, file=sys.stderr)
+
+    reference = materialize_plain(args.reference, log=_log)
+    genomes = [materialize_plain(g, log=_log) for g in args.genome]
+
     # Prepare protein FASTA (optionally de-duplicated with cd-hit, then optionally TEsorter two-pass)
     # Use basename to ensure artifacts are created in CWD, not alongside the source reference
-    prot_for_miniprot = args.reference
+    prot_for_miniprot = reference
     created_cdhit_base = None
     tesorter_artifacts = None
 
     if args.cdhit:
-        cleaned = run_cdhit_on_proteins(args.reference)
+        cleaned = run_cdhit_on_proteins(reference)
         prot_for_miniprot = cleaned
         created_cdhit_base = cleaned
 
@@ -484,8 +581,8 @@ def main():
         prot_for_miniprot = final_no_tes
         tesorter_artifacts = artifacts
 
-    for genome in args.genome:
-        prefix = os.path.splitext(os.path.basename(genome))[0]
+    for genome in genomes:
+        prefix = fasta_stem(genome)
 
         if "fai" in want:
             print(f"Indexing FASTA (samtools faidx): {genome}", file=sys.stderr)
