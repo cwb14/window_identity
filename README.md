@@ -39,6 +39,40 @@ Requires, in addition to the previous dependencies: `cd-hit`, `diamond`, and (un
 `-tesorter no`) `TEsorter`, `seqkit`, `blastp`, `makeblastdb`. The script checks for these
 up front and fails fast rather than dying part-way through a long run.
 
+#### Synonymous divergence (Ks)
+On by default. The syntenic anchors are already ortholog pairs, so the same liftover that
+feeds the synteny front-end also yields in-frame CDS (`cds_walker.py`), and the two are
+handed to ParaAT (mafft + pal2nal) and KaKs_Calculator:
+
+```
+liftover --outputs inframe -> {id}.cds.inframe
+  + {ID1}.{ID2}.clean.anchors (already ParaAT's homolog format)
+  -> ParaAT (mafft -> Epal2nal -> axt) -> KaKs_Calculator -> ks_summary -> matrix/tree/density
+```
+
+Per genome pair, the distance is the **median** Ks over gene pairs, keeping `0 < Ks < -ks_max`.
+The median (not the mean) because Ks has a long right tail from paralogous and saturated
+anchors that drags a mean upward.
+
+```
+-kaks yes|no        # run the Ks branch                        (default yes)
+-kaks_method NAME   # KaKs_Calculator method                   (default YN; 'ALL' unsupported)
+-ks_rate RATE       # SYNONYMOUS rate for the Ks time tree     (default 1.5e-8)
+-ks_max FLOAT       # saturation cutoff before the median      (default 2.0)
+```
+
+`-ks_rate` is deliberately separate from `-mutation_rate`: the latter is a genome-wide
+nucleotide rate and calibrates the K2P tree, while Ks is a synonymous rate. Reusing one for
+both would bias the Ks divergence times.
+
+Outputs, mirroring the K2P set: `ks_density.pdf` (per-pair Ks density, dashed line at each
+median), `ks_matrix.tsv`, `ks_matrix.nwk`(`.ape.pdf`), `ks_matrix.time.nwk`(`.ape.pdf`), plus
+per-pair `{ID1}.{ID2}.kaks.tsv` and the codon alignments `{ID1}.{ID2}.axt`.
+
+ParaAT and KaKs_Calculator are fetched and compiled on first use into `window_identity/tools/`
+by `bin/setup_kaks_tools.sh` (needs `git`, `make`, `g++` that once; `perl` and `mafft` every
+run). mafft is the aligner because ParaAT's `muscle` command line is muscle-v3 syntax and
+breaks silently against muscle v5.
 
 #### Note....  
 ##### One #####

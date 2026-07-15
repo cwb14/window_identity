@@ -27,6 +27,11 @@ CSCORE=0.99
 # Synteny block consolidation (see Steps 6-9). Defaults match synLTR/module1.py.
 MIN_BLOCK_SIZE=15000
 STITCH_GAPS="yes"
+# Pairwise Ks on the syntenic anchors (Steps 20-21), via ParaAT -> KaKs_Calculator.
+KAKS="yes"
+KAKS_METHOD="YN"
+KS_RATE=1.5e-8
+KS_MAX=2.0
 
 # Help menu function
 usage() {
@@ -75,6 +80,21 @@ Options:
                                synthetic block, so inter-anchor intervals are aligned rather
                                than dropped (default: $STITCH_GAPS). Guarded against inversions
                                and rearrangements.
+  -kaks yes|no                 Estimate pairwise Ks on the syntenic anchors with ParaAT +
+                               KaKs_Calculator, then build the Ks density plot, distance
+                               matrix, and tree (default: $KAKS). Adds the in-frame CDS to
+                               the liftover and fetches/builds both tools on first use.
+  -kaks_method METHOD          KaKs_Calculator method: NG, LWL, LPB, MLWL, MLPB, GY, YN,
+                               MYN, MS, or MA (default: $KAKS_METHOD). YN is the standard for
+                               Ks distributions and is fast enough for whole-proteome anchor
+                               sets; MA is more accurate but much slower. 'ALL' is not
+                               supported -- it emits one row per method, which would mix
+                               methods into a single median.
+  -ks_rate RATE                Synonymous substitution rate for the Ks divergence-time tree
+                               (default: $KS_RATE). Distinct from -mutation_rate, which is a
+                               genome-wide nucleotide rate and calibrates the K2P tree.
+  -ks_max FLOAT                Drop gene pairs with Ks >= this before taking the median
+                               (default: $KS_MAX). Above ~2, Ks is saturated and unstable.
   -h, --help                   Show this help message and exit
 EOF
 }
@@ -166,6 +186,22 @@ while [[ $# -gt 0 ]]; do
         STITCH_GAPS="$2"
         shift; shift
         ;;
+    -kaks)
+        KAKS="$2"
+        shift; shift
+        ;;
+    -kaks_method)
+        KAKS_METHOD="$2"
+        shift; shift
+        ;;
+    -ks_rate)
+        KS_RATE="$2"
+        shift; shift
+        ;;
+    -ks_max)
+        KS_MAX="$2"
+        shift; shift
+        ;;
     *)
         echo "Error: Unknown option $1"
         usage
@@ -213,10 +249,32 @@ case "$TESORTER" in
     *) echo "Error: -tesorter must be 'yes' or 'no' (got '$TESORTER')."; exit 1 ;;
 esac
 
+case "$KAKS" in
+    yes|no) ;;
+    *) echo "Error: -kaks must be 'yes' or 'no' (got '$KAKS')."; exit 1 ;;
+esac
+
+# 'ALL' is deliberately excluded: KaKs_Calculator emits one row per method under ALL, and
+# ks_summary.py would take the median across a mixture of methods.
+case "$KAKS_METHOD" in
+    NG|LWL|LPB|MLWL|MLPB|GY|YN|MYN|MS|MA) ;;
+    *)
+        echo "Error: -kaks_method must be one of NG LWL LPB MLWL MLPB GY YN MYN MS MA (got '$KAKS_METHOD')."
+        exit 1
+        ;;
+esac
+
 # Fail fast on missing tools rather than part-way through a long run.
 required_tools=(python miniprot bedtools bioawk samtools cd-hit diamond)
 if [[ "$TESORTER" == "yes" ]]; then
     required_tools+=(TEsorter seqkit blastp makeblastdb)
+fi
+if [[ "$KAKS" == "yes" ]]; then
+    # ParaAT.pl is perl and shells out to an aligner. mafft is the one to use: ParaAT's
+    # muscle command line is muscle-v3 syntax and silently breaks against muscle v5, and
+    # clustalw2/t_coffee are rarely installed. git/make are only needed if the toolchain
+    # has to be built, so setup_kaks_tools.sh checks for those itself.
+    required_tools+=(perl mafft)
 fi
 missing_tools=()
 for tool in "${required_tools[@]}"; do
@@ -232,6 +290,16 @@ fi
 LIFTOVER_OPTS=(--outn "$OUTN" --outs "$OUTS" --outc "$OUTC" --cdhit)
 if [[ "$TESORTER" == "yes" ]]; then
     LIFTOVER_OPTS+=(--TEsorter)
+fi
+
+# 'inframe' runs cds_walker.py to emit frame-corrected CDS ('{id}_mod.cds.inframe') for the
+# lifted-over genes. That is the nucleotide input ParaAT needs to back-translate the peptide
+# alignments in Step 20; without it there is nothing to compute Ks from.
+LIFTOVER_OUTPUTS=(gff pep bed)
+LIFTOVER_EXTS=(pep bed)
+if [[ "$KAKS" == "yes" ]]; then
+    LIFTOVER_OUTPUTS+=(inframe)
+    LIFTOVER_EXTS+=(cds.inframe)
 fi
 
 # Assembled once and reused by the consolidator in Step 8.
@@ -292,6 +360,22 @@ if [[ ${#_dupe_ids[@]} -gt 0 ]]; then
     exit 1
 fi
 
+# The liftover renames its per-genome peptides to '{id}.pep' (see Steps 2-4). If the
+# reference proteome is itself named '{id}.pep' for one of the genomes -- '-ref Athal.fa
+# -peptide Athal.pep' -- that rename overwrites the reference with the lifted-over peptides.
+# The first run still succeeds, because the liftover reads the reference before the rename
+# clobbers it, but the input is destroyed and any later run in that directory silently uses
+# a self-referential proteome. Warn rather than abort: a directory where this already
+# happened still resumes correctly from the cached '{id}_mod.gff'.
+for genome in "${ALL_GENOMES[@]}"; do
+    if [[ "$(basename "$PROTEIN")" == "${GENOME_IDS[$genome]}.pep" ]]; then
+        echo "WARNING: the reference proteome '$PROTEIN' has the same name as the liftover"
+        echo "         output for genome '${GENOME_IDS[$genome]}', and will be OVERWRITTEN by it."
+        echo "         Keep a copy, or rename it (e.g. '${GENOME_IDS[$genome]}_ref.pep') and re-run."
+        break
+    fi
+done
+
 # A genome whose sequences would all be dropped by the renamer yields an empty *_mod.fa, which
 # only surfaces much later as an opaque miniprot "failed to open/build the index". Catch it here,
 # before cd-hit/TEsorter/miniprot spend CPU on a run that is already doomed. Reads headers only.
@@ -339,46 +423,53 @@ fi
 # and '{id}_mod.bed'. jcvi_list.txt and the whole anchor chain key off the bare '{id}', so the
 # two are renamed below. '{id}_mod.gff' is deliberately left in place: liftover.py reuses an
 # existing GFF and skips the expensive miniprot run on resume.
+# The resume check must cover every extension requested, '.cds.inframe' included. A run
+# directory left over from a -kaks no run already has .pep/.bed, so checking only those
+# would skip the liftover forever and Step 20 would never find its CDS. Re-running is cheap:
+# liftover.py reuses the existing '{id}_mod.gff' and the cached TEsorter screen, so neither
+# miniprot nor TEsorter repeats -- only the peptide/CDS extraction does.
 liftover_outputs_exist=true
 for genome in "${ALL_GENOMES[@]}"; do
     id="${GENOME_IDS[$genome]}"
-    if [[ ! -s "${id}.pep" || ! -s "${id}.bed" ]]; then
-        liftover_outputs_exist=false
-        break
-    fi
+    for ext in "${LIFTOVER_EXTS[@]}"; do
+        if [[ ! -s "${id}.${ext}" ]]; then
+            liftover_outputs_exist=false
+            break 2
+        fi
+    done
 done
 
 if [[ "$liftover_outputs_exist" = false ]]; then
-    echo "Steps 2-4 - Liftover $PROTEIN onto each genome (tesorter=$TESORTER)"
+    echo "Steps 2-4 - Liftover $PROTEIN onto each genome (tesorter=$TESORTER, kaks=$KAKS)"
     mod_fastas=()
     for genome in "${ALL_GENOMES[@]}"; do
         mod_fastas+=("${GENOME_IDS[$genome]}_mod.fa")
     done
 
-    echo "Running: python $BIN_DIR/liftover.py --genome ${mod_fastas[*]} --reference $PROTEIN ${LIFTOVER_OPTS[*]} --threads $THREADS --outputs gff pep bed"
+    echo "Running: python $BIN_DIR/liftover.py --genome ${mod_fastas[*]} --reference $PROTEIN ${LIFTOVER_OPTS[*]} --threads $THREADS --outputs ${LIFTOVER_OUTPUTS[*]}"
     python "$BIN_DIR/liftover.py" \
         --genome "${mod_fastas[@]}" \
         --reference "$PROTEIN" \
         "${LIFTOVER_OPTS[@]}" \
         --threads "$THREADS" \
-        --outputs gff pep bed
+        --outputs "${LIFTOVER_OUTPUTS[@]}"
 
     # Rename to the bare genome ID that jcvi_list.txt and the anchor chain expect.
     for genome in "${ALL_GENOMES[@]}"; do
         id="${GENOME_IDS[$genome]}"
-        for ext in pep bed; do
+        for ext in "${LIFTOVER_EXTS[@]}"; do
             if [[ -s "${id}_mod.${ext}" ]]; then
                 mv -f "${id}_mod.${ext}" "${id}.${ext}"
             fi
+            if [[ ! -s "${id}.${ext}" ]]; then
+                echo "Error: liftover produced no ${id}.${ext}."
+                echo "       Check that $PROTEIN aligns to ${id}_mod.fa."
+                exit 1
+            fi
         done
-        if [[ ! -s "${id}.pep" || ! -s "${id}.bed" ]]; then
-            echo "Error: liftover produced no ${id}.pep / ${id}.bed."
-            echo "       Check that $PROTEIN aligns to ${id}_mod.fa."
-            exit 1
-        fi
     done
 else
-    echo "Steps 2-4 - Liftover outputs (.pep/.bed) exist. Skipping."
+    echo "Steps 2-4 - Liftover outputs (${LIFTOVER_EXTS[*]}) exist. Skipping."
 fi
 
 # Step 5 - Anchor proteins between each genome pair
@@ -685,6 +776,8 @@ echo "Running: $plot_cmd"
 eval "$plot_cmd"
 
 # Build the tree from the cleaned matrix.
+# --prefix defaults to k2p_matrix, so this pass picks up k2p_matrix*.tsv only and the Ks
+# matrices written in Step 21 are left to their own pass.
 echo "Step 19 - Building phylogenetic tree using UPGMA"
 upgma_cmd="Rscript $BIN_DIR/upgma.R --method upgma"
 if [[ -n "$MUTATION_RATE" ]]; then
@@ -695,3 +788,125 @@ if [[ -n "$NAMES" ]]; then
 fi
 echo "Running: $upgma_cmd"
 eval "$upgma_cmd"
+
+if [[ "$KAKS" != "yes" ]]; then
+    echo "Steps 20-21 - Ks estimation disabled (-kaks no). Done."
+    exit 0
+fi
+
+# Step 20 - Pairwise Ks on the syntenic anchors (ParaAT -> KaKs_Calculator).
+#
+# The anchors are already exactly what ParaAT wants. '{ID1}.{ID2}.clean.anchors' is two
+# columns of gene IDs -- ParaAT's homolog format -- once MCscan's '###' block separators are
+# stripped. And because liftover.py prefixes every gene ID with its genome ('Athal_mod000001'),
+# the two genomes' .pep and .cds.inframe can simply be concatenated with no risk of an ID
+# collision silently pairing a gene with itself.
+#
+# Ks is computed off the liftover of a single reference proteome onto every genome, so it is
+# independent of Steps 10-19 (the minimap2/K2P branch) and reads only the Step 2-5 outputs.
+echo "Step 20 - Pairwise Ks (ParaAT + KaKs_Calculator, method=$KAKS_METHOD)"
+
+TOOLS_DIR="$SCRIPT_DIR/tools"
+if ! bash "$BIN_DIR/setup_kaks_tools.sh" "$TOOLS_DIR"; then
+    echo "Error: could not set up the ParaAT/KaKs_Calculator toolchain in $TOOLS_DIR." >&2
+    exit 1
+fi
+# ParaAT.pl resolves Epal2nal.pl, mafft, and KaKs_Calculator by walking PATH and testing -x.
+export PATH="$TOOLS_DIR/ParaAT:$TOOLS_DIR/shim:$PATH"
+# Read by the shim. ParaAT hardcodes its KaKs command line, so -m cannot be passed through it.
+export KAKS_METHOD
+
+# ParaAT takes the processor count as a FILE, not a number, and re-reads it between batches
+# so it can be retuned mid-run.
+#
+# Three constraints on the paths below, all forced by ParaAT.pl internals -- do not
+# "tidy" them into absolute paths:
+#   * ParaAT chdir()s into its output folder, then re-reads the processor file as
+#     '../$ProcessFile'. So -p must be RELATIVE to the launch directory, and the -o folder
+#     must sit exactly ONE level below it, or '../' misses and ParaAT silently falls back to
+#     a default thread count.
+#   * -h/-a/-n are read before that chdir, so they resolve against the launch directory.
+PROC_FILE="paraat.proc"
+echo "$THREADS" >"$PROC_FILE"
+
+while read -r line; do
+    ID1=$(echo "$line" | awk '{print $1}')
+    ID2=$(echo "$line" | awk '{print $2}')
+    kaks_tsv="${ID1}.${ID2}.kaks.tsv"
+
+    if [[ -s "$kaks_tsv" ]]; then
+        echo "Ks table $kaks_tsv exists. Skipping."
+        continue
+    fi
+
+    homologs="${ID1}.${ID2}.homologs"
+    pair_pep="${ID1}.${ID2}.paraat.pep"
+    pair_cds="${ID1}.${ID2}.paraat.cds"
+    outdir="kaks_${ID1}_${ID2}"
+
+    grep -v '^###' "${ID1}.${ID2}.clean.anchors" | cut -f1,2 >"$homologs"
+    cat "${ID1}.pep" "${ID2}.pep" >"$pair_pep"
+    cat "${ID1}.cds.inframe" "${ID2}.cds.inframe" >"$pair_cds"
+
+    echo "Running ParaAT on $(wc -l <"$homologs") anchor pairs from $ID1/$ID2 -> $outdir"
+    # A partial ParaAT run leaves stale per-gene files that the next pass would fold into the
+    # merged table, so start clean.
+    rm -rf "$outdir"
+    ParaAT.pl -h "$homologs" -a "$pair_pep" -n "$pair_cds" \
+        -p "$PROC_FILE" -m mafft -f axt -k -o "$outdir"
+
+    # ParaAT writes one .kaks per gene pair. Merge them into a single table, keeping one
+    # header. Anchors whose peptide carries an internal stop (miniprot pseudogene calls) fail
+    # in Epal2nal and are simply absent here, so the count is reported rather than assumed.
+    first_kaks=$(find "$outdir" -name '*.kaks' -print -quit)
+    if [[ -z "$first_kaks" ]]; then
+        echo "Error: ParaAT/KaKs produced no .kaks files in $outdir." >&2
+        echo "       Check $outdir/msg.msa and $outdir/msg.kaks." >&2
+        exit 1
+    fi
+    # 'xargs -r' matters: with no matches, a bare 'xargs cat'/'xargs awk' can run the command
+    # with no file operands, which makes it read stdin and block. FNR resets per file, so the
+    # header skip stays correct even when xargs splits the list across several awk calls.
+    head -1 "$first_kaks" >"$kaks_tsv"
+    find "$outdir" -name '*.kaks' -print0 | xargs -0 -r awk 'FNR > 1 && NF {print}' >>"$kaks_tsv"
+    echo "Wrote $kaks_tsv ($(($(wc -l <"$kaks_tsv") - 1)) of $(wc -l <"$homologs") anchor pairs scored)"
+
+    # Keep the codon alignments as one file, then drop the directory. ParaAT emits one .axt
+    # and one .kaks per gene pair, which is a few hundred thousand inodes across a run.
+    find "$outdir" -name '*.cds_aln.axt' -print0 | xargs -0 -r cat >"${ID1}.${ID2}.axt"
+    rm -rf "$outdir" "$pair_pep" "$pair_cds"
+done <jcvi_list.txt
+
+# Step 21 - Summarise Ks, then build the density plot, distance matrix, and tree.
+if [[ ! -s "ks_genome.tsv" ]]; then
+    echo "Step 21 - Summarising Ks (median per genome pair, 0 < Ks < $KS_MAX)"
+    python "$BIN_DIR/ks_summary.py" \
+        -list jcvi_list.txt \
+        -max_ks "$KS_MAX" \
+        -genome_out ks_genome.tsv \
+        -long_out ks_all.tsv
+else
+    echo "Step 21 - ks_genome.tsv exists. Skipping."
+fi
+
+if [[ ! -s "ks_matrix.tsv" ]]; then
+    echo "Building the Ks matrix"
+    python "$BIN_DIR/matrix_builder.py" -in ks_genome.tsv >ks_matrix.tsv
+else
+    echo "ks_matrix.tsv exists. Skipping."
+fi
+
+echo "Plotting the Ks density distribution"
+ks_plot_cmd="Rscript $BIN_DIR/ks_density_plotter.R -i ks_all.tsv -o ks_density.pdf --max_ks $KS_MAX"
+echo "Running: $ks_plot_cmd"
+eval "$ks_plot_cmd"
+
+# Same UPGMA machinery as Step 19, pointed at ks_matrix*.tsv and calibrated with the
+# synonymous rate rather than the genome-wide nucleotide rate.
+echo "Building the Ks tree (UPGMA, synonymous rate $KS_RATE)"
+ks_tree_cmd="Rscript $BIN_DIR/upgma.R --method upgma --prefix ks_matrix --xlab Ks --mutation_rate $KS_RATE"
+if [[ -n "$NAMES" ]]; then
+    ks_tree_cmd+=" --name_key $NAMES"
+fi
+echo "Running: $ks_tree_cmd"
+eval "$ks_tree_cmd"
