@@ -2,6 +2,11 @@
 
 import argparse
 import sys
+
+from gene_coords_extractor_all4 import (
+    directionality as _directionality,
+    get_gene_coords as _get_gene_coords,
+)
 import os
 
 def modify_bed_file(file_name):
@@ -30,21 +35,12 @@ def read_bed_data(bed_files):
 
 
 def get_gene_coords(merged_data):
+    """geneID -> (chrom, start, end, strand).
+
+    Delegates to the block extractor's parser so both partitioning modes share one
+    strand-aware implementation; block orientation depends on column 6.
     """
-    Parse merged BED lines into a dict mapping geneID -> (chrom, start, end).
-    """
-    gene_coords = {}
-    for line in merged_data:
-        parts = line.split("\t")
-        if len(parts) < 4:
-            sys.stderr.write(f"Skipping malformed BED line: {line}\n")
-            continue
-        chrom, start, end, geneID = parts[:4]
-        try:
-            gene_coords[geneID] = (chrom, int(start), int(end))
-        except ValueError:
-            sys.stderr.write(f"Invalid coordinates in line: {line}\n")
-    return gene_coords
+    return _get_gene_coords(merged_data)
 
 
 def read_gene_pairs(gene_pairs_filename):
@@ -101,10 +97,11 @@ def process_pairs(blocks, gene_coords):
                 )
                 continue
 
-            # Determine directionality based on start positions
-            direction1 = "+" if coords1[1] < coords3[1] else "-"
-            direction2 = "+" if coords2[1] < coords4[1] else "-"
-            directionality = "+" if direction1 == direction2 else "-"
+            # Orientation from relative gene strand, not gene order -- see
+            # gene_coords_extractor_all4.directionality() for why the order rule was wrong.
+            directionality = _directionality(coords1, coords2, coords3, coords4)
+            if directionality is None:
+                directionality = "+" if coords1[3] == coords2[3] else "-"
 
             # Build spanning coordinate ranges
             range1_start = min(coords1[1], coords3[1])

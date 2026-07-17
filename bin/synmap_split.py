@@ -1,323 +1,362 @@
 #!/usr/bin/env python3
+"""Extract syntenic segment pairs and align them, emitting contract-compliant PAF.
 
-import os
-import sys
+Backends are selected with --aligner. Each one only produces alignments; all coordinate
+mapping and tag construction live in paf_emit.py, so the arithmetic is written and tested
+once instead of once per backend. See step10_dev/memo_step10_diagnosis.md for the audit
+behind that split and for the PAF contract Steps 11-17 depend on.
+"""
+
 import argparse
-import shutil
+import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from multiprocessing import Pool, Manager
-from Bio import SeqIO
-from Bio.SeqRecord import SeqRecord
 
-# Global variables
-MINIMAP2_BIN = None
-PRESET = "asm10"
+import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import aligners
+import paf_emit
+from orient import orientation, revcomp
+
 VERBOSE = False
+_FASTA_CACHE = {}
 
-# Logging helper
+
 def log(msg):
     if VERBOSE:
         print(msg)
 
-# Function to parse syncoord and extract sequences
-def extract_sequence(fasta_file, syncoord, reverse_complement=False):
+
+def warn(msg):
+    print(msg, file=sys.stderr)
+
+
+# ------------------------------------------------------------------ sequence access
+
+
+def get_fasta(path):
+    """Indexed, per-process handle. The old code re-parsed the whole genome with SeqIO for
+    every coords line -- 3088 full passes over an 18-78MB FASTA."""
+    fa = _FASTA_CACHE.get(path)
+    if fa is None:
+        fa = pysam.FastaFile(path)
+        _FASTA_CACHE[path] = fa
+    return fa
+
+
+def parse_syncoord(syncoord):
+    """'AthaAt4_chr4:11535683..11542200' -> ('AthaAt4', 'AthaAt4_chr4', 11535683, 11542200).
+
+    Coordinates are 1-based inclusive, as written by gene_coords_extractor_all4.py.
+    """
+    name, rng = syncoord.split(":")
+    start, end = (int(x) for x in rng.split(".."))
+    accession = name.split("_")[0]
+    return accession, name, start, end
+
+
+def extract(genome_dir, syncoord, do_revcomp=False, upper=True):
+    accession, name, start, end = parse_syncoord(syncoord)
+    fa = get_fasta(os.path.join(genome_dir, f"{accession}_mod.fa"))
+    seq = fa.fetch(name, start - 1, end)  # 1-based inclusive -> 0-based half-open
+    if upper:
+        # WFA compares raw bytes and these genomes are ~20% soft-masked, so 'a' vs 'A'
+        # would score as a mismatch. minimap2 is case-insensitive, so this is a no-op there.
+        seq = seq.upper()
+    return revcomp(seq) if do_revcomp else seq
+
+
+# ------------------------------------------------------------------ backends
+
+
+def align_minimap2(tseq, qseq, seg, opts):
+    """Native minimap2, coordinates corrected, every other field untouched.
+
+    Deliberately does not go through the emitter: keeping minimap2's own tags byte-identical
+    is what lets the regression gate prove the coordinate fix did not move de/k2p.
+    """
+    d = tempfile.mkdtemp(dir=opts["temp_base"])
     try:
-        accession_seqid, pos_range = syncoord.split(":")
-        start, end = map(int, pos_range.split(".."))
-        accession_id, seqid = accession_seqid.split("_")
-        log(f"Parsed syncoord: accession_id={accession_id}, seqid={seqid}, start={start}, end={end}")
-    except ValueError as e:
-        log(f"Error parsing syncoord: {syncoord}. Expected format 'accessionID_seqID:start..end'. Error: {e}")
-        return None
+        t_fa, q_fa = os.path.join(d, "t.fa"), os.path.join(d, "q.fa")
+        with open(t_fa, "w") as fh:
+            fh.write(f">{seg.t_name}\n{tseq}\n")
+        with open(q_fa, "w") as fh:
+            fh.write(f">{seg.q_name}\n{qseq}\n")
+        cmd = [opts["minimap2_bin"], "-t", str(opts["threads"]), "--secondary=no",
+               "--cs=short", "-x", opts["preset"], "-c", t_fa, q_fa]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=opts["timer"])
+        if res.returncode != 0:
+            log(f"minimap2 error: {res.stderr}")
+            return []
+        out = []
+        for line in res.stdout.strip().split("\n"):
+            if line:
+                out.append(paf_emit.shift_native_paf(line, seg))
+        return out
+    finally:
+        if not opts["debug"]:
+            for f in ("t.fa", "q.fa"):
+                try:
+                    os.remove(os.path.join(d, f))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
 
-    log(f"Extracting sequence from {fasta_file} with syncoord {syncoord} (reverse_complement={reverse_complement})")
 
-    with open(fasta_file, "r") as handle:
-        for record in SeqIO.parse(handle, "fasta"):
-            if record.id == f"{accession_id}_{seqid}":
-                seq = record.seq[start-1:end]
-                if reverse_complement:
-                    seq = seq.reverse_complement()
-                return SeqRecord(seq, id=record.id, description="")
-    log(f"No matching header found for {syncoord} in {fasta_file}")
-    return None
+def _emit(records, seg, tseq, qseq):
+    return [paf_emit.format_paf(r, seg, tseq, qseq) for r in records]
 
-# Function to extract start position from file name
-def extract_start_pos(file_name):
-    base = os.path.basename(file_name).replace('.fa', '')
-    parts = base.split('_')
-    return int(parts[-2])
 
-# Convert timer string to seconds
-def convert_timer_to_seconds(timer_str):
-    if not timer_str:
-        return None
-    unit = timer_str[-1]
-    value = int(timer_str[:-1])
-    if unit == 'd': return value * 86400
-    if unit == 'h': return value * 3600
-    if unit == 'm': return value * 60
-    if unit == 's': return value
-    raise ValueError(f"Invalid time unit in '{timer_str}'. Use 'd', 'h', 'm', or 's'.")
+def align_wfa_lines(tseq, qseq, seg, opts):
+    return _emit(aligners.align_wfa(tseq, qseq, seg, opts), seg, tseq, qseq)
 
-# Run minimap2 alignment and adjust coordinates
-def run_minimap(seq1_file, seq2_file, output_file, threads, timer, orig_line):
-    """
-    Run minimap2 on two temporary FASTA files, adjust PAF coordinates by the window starts,
-    and append results to output_file. On timeout, let the exception bubble up so the caller
-    can print the skipped coordinate line.
-    """
-    cmd = (
-        f"{MINIMAP2_BIN} -t {threads} --secondary=no "
-        f"--cs=short -x {PRESET} -c {seq1_file} {seq2_file}"
-    )
-    log(f"Running minimap2 with command: {cmd}")
-    start1 = extract_start_pos(seq1_file)
-    start2 = extract_start_pos(seq2_file)
 
-    # Let subprocess.TimeoutExpired bubble up to the caller
-    result = subprocess.run(
-        cmd,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timer
-    )
+def align_last_lines(tseq, qseq, seg, opts):
+    return _emit(aligners.align_last(tseq, qseq, seg, opts), seg, tseq, qseq)
 
-    # If minimap2 returns an error, log and return
-    if result.returncode != 0:
-        log(f"Error running minimap2: {result.stderr}")
+
+BACKENDS = {
+    "minimap2": align_minimap2,
+    "last": align_last_lines,
+    "wfa": align_wfa_lines,
+}
+
+
+# ------------------------------------------------------------------ per-segment driver
+
+
+def build_segment(syncoord1, syncoord2, q_revcomp):
+    _, t_name, t_start, t_end = parse_syncoord(syncoord1)
+    _, q_name, q_start, q_end = parse_syncoord(syncoord2)
+    return paf_emit.Segment(t_name, t_start, t_end, q_name, q_start, q_end, q_revcomp)
+
+
+def length_ratio(seg):
+    lo, hi = sorted((seg.t_len, seg.q_len))
+    return float("inf") if lo <= 0 else hi / lo
+
+
+def process_line(args):
+    line, genome_dir, opts, counter, skipped = args
+    try:
+        syncoord1, syncoord2, strand = line.strip().split("\t")
+    except ValueError:
+        warn(f"malformed coords line, skipping: {line.strip()!r}")
+        counter.value += 1
         return
 
-    # Parse and shift PAF coordinates
-    adjusted = []
-    for paf_line in result.stdout.strip().split('\n'):
-        if not paf_line:
-            continue
-        cols = paf_line.split('\t')
-        if len(cols) < 12:
-            log(f"Invalid PAF line: {paf_line}")
-            continue
-        # shift query (cols[2], cols[3]) by start2 and target (cols[7], cols[8]) by start1
-        cols[2] = str(int(cols[2]) + start2)
-        cols[3] = str(int(cols[3]) + start2)
-        cols[7] = str(int(cols[7]) + start1)
-        cols[8] = str(int(cols[8]) + start1)
-        adjusted.append('\t'.join(cols))
+    try:
+        seg_probe = build_segment(syncoord1, syncoord2, False)
 
-    # Write adjusted lines to the output PAF
-    with open(output_file, 'a') as f:
-        for line in adjusted:
-            f.write(line + '\n')
+        # Guard before doing any work. A 242:1 span is not alignable end-to-end; riparian's
+        # rescue machinery deliberately keeps such blocks for plot completeness, which is
+        # the opposite of what an aligner wants, so only its ratio test is borrowed.
+        if seg_probe.t_len <= 0 or seg_probe.q_len <= 0:
+            skipped.append(f"{syncoord1}\t{syncoord2}\t{strand}\tempty_span\t0\t"
+                           f"{seg_probe.t_len}\t{seg_probe.q_len}")
+            counter.value += 1
+            return
+        ratio = length_ratio(seg_probe)
+        if opts["max_len_ratio"] > 0 and ratio > opts["max_len_ratio"]:
+            skipped.append(f"{syncoord1}\t{syncoord2}\t{strand}\tlength_ratio\t{ratio:.1f}\t"
+                           f"{seg_probe.t_len}\t{seg_probe.q_len}")
+            counter.value += 1
+            return
 
-# Process each line of coords
-def process_line(args):
-    line, genome_dir, temp_base, threads, output_file, debug_mode, timer, counter = args
-    syncoord1, syncoord2, strand = line.strip().split("\t")
-    log(f"Processing line: {line.strip()}")
+        tseq = extract(genome_dir, syncoord1)
 
-    temp_dir = tempfile.mkdtemp(dir=temp_base)
-    seq1_file = os.path.join(temp_dir, syncoord1.replace(":", "_").replace("..", "_") + ".fa")
-    seq2_file = os.path.join(temp_dir, syncoord2.replace(":", "_").replace("..", "_") + ".fa")
+        if opts["aligner"] == "minimap2":
+            # Preserve historical behaviour exactly: trust the strand column, and let
+            # minimap2's own both-strand search cover it being wrong.
+            q_revcomp = (strand == "-")
+        else:
+            # Strand-sensitive backend: settle orientation from sequence.
+            q_fwd = extract(genome_dir, syncoord2, do_revcomp=False)
+            needs_rc = orientation(tseq, q_fwd, opts["minimap2_bin"], opts["preset"])
+            if needs_rc is None:
+                skipped.append(f"{syncoord1}\t{syncoord2}\t{strand}\tno_orientation\t"
+                               f"{ratio:.1f}\t{seg_probe.t_len}\t{seg_probe.q_len}")
+                counter.value += 1
+                return
+            q_revcomp = needs_rc
 
-    genome1 = os.path.join(genome_dir, syncoord1.split(":")[0].split("_")[0] + "_mod.fa")
-    genome2 = os.path.join(genome_dir, syncoord2.split(":")[0].split("_")[0] + "_mod.fa")
+        seg = build_segment(syncoord1, syncoord2, q_revcomp)
+        qseq = extract(genome_dir, syncoord2, do_revcomp=q_revcomp)
 
-    seq1 = extract_sequence(genome1, syncoord1)
-    seq2 = extract_sequence(genome2, syncoord2, reverse_complement=(strand == "-"))
-
-    if seq1 and seq2:
-        SeqIO.write(seq1, seq1_file, "fasta")
-        SeqIO.write(seq2, seq2_file, "fasta")
         try:
-            # pass the original line so run_minimap can report on timeouts
-            run_minimap(seq1_file, seq2_file, output_file, threads, timer, line)
-            
+            lines = BACKENDS[opts["aligner"]](tseq, qseq, seg, opts)
         except subprocess.TimeoutExpired:
-            # timeout → split the two coords at their midpoints and re-run
-            syn1, syn2, strand = line.strip().split("\t")
+            skipped.append(f"{syncoord1}\t{syncoord2}\t{strand}\ttimeout\t{ratio:.1f}\t"
+                           f"{seg_probe.t_len}\t{seg_probe.q_len}")
+            counter.value += 1
+            return
 
-            def midpoint(coord):
-                acc, rng = coord.split(":")
-                start, end = map(int, rng.split(".."))
-                mid = start + (end - start) // 2
-                return mid
+        if lines:
+            with open(opts["output_file"], "a") as fh:
+                fh.write("\n".join(lines) + "\n")
+    except Exception as exc:  # noqa: BLE001 - one bad segment must not kill the pool
+        warn(f"error on {line.strip()!r}: {exc}")
+    finally:
+        counter.value += 1
 
-            m1 = midpoint(syn1)
-            m2 = midpoint(syn2)
 
-            first  = f"{syn1.split(':')[0]}:{syn1.split(':')[1].split('..')[0]}..{m1}"
-            first2 = f"{syn2.split(':')[0]}:{syn2.split(':')[1].split('..')[0]}..{m2}"
-            second  = f"{syn1.split(':')[0]}:{m1}..{syn1.split(':')[1].split('..')[1]}"
-            second2 = f"{syn2.split(':')[0]}:{m2}..{syn2.split(':')[1].split('..')[1]}"
+# ------------------------------------------------------------------ main
 
-            print(
-                f"Splitting coordinates line '{line.strip()}' and reprocessing. "
-                f"Now '{first}\\t{first2}\\t{strand}' and '{second}\\t{second2}\\t{strand}'."
-            )
 
-#            # recursively handle each half
-#            for new1, new2 in ((first, first2), (second, second2)):
-#                # extract, write, and align just like above
-#                rec1 = extract_sequence(genome1, new1)
-#                rec2 = extract_sequence(genome2, new2, reverse_complement=(strand == "-"))
-#                if rec1 and rec2:
-#                    # write temp FASTAs
-#                    SeqIO.write(rec1, seq1_file, "fasta")
-#                    SeqIO.write(rec2, seq2_file, "fasta")
-#                    run_minimap(seq1_file, seq2_file, output_file, threads, timer, f"{new1}\t{new2}\t{strand}")
-
-            for new1, new2 in ((first, first2), (second, second2)):
-                rec1 = extract_sequence(genome1, new1)
-                rec2 = extract_sequence(genome2, new2, reverse_complement=(strand == "-"))
-                if not (rec1 and rec2):
-                    continue
-                SeqIO.write(rec1, seq1_file, "fasta")
-                SeqIO.write(rec2, seq2_file, "fasta")
-
-                try:
-                    run_minimap(seq1_file, seq2_file, output_file,
-                                threads, timer,
-                                f"{new1}\t{new2}\t{strand}")
-                except subprocess.TimeoutExpired:
-                    # if *this* half still times out, split it again
-                    # you can either re-apply exactly the same splitting logic
-                    # or call a helper to do it recursively:
-                    process_line((f"{new1}\t{new2}\t{strand}",
-                                  genome_dir, temp_base,
-                                  threads,
-                                  output_file, debug_mode,
-                                  timer, counter))
-
-    # Clean up
-    if not debug_mode:
-        try:
-            os.remove(seq1_file)
-            os.remove(seq2_file)
-            os.rmdir(temp_dir)
-        except OSError:
-            pass
-    # Increment processed counter
-    counter.value += 1
-
-# Main entry point
 def main():
-    parser = argparse.ArgumentParser(
-        description="Syntenic genomic sequence extraction and alignment using minimap2."
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("-pairedIDs", nargs='+', help="List of accession IDs to include for analysis.")
-    group.add_argument("-singleID", help="Single accession ID to include for analysis.")
-    parser.add_argument("-t", "--threads", type=int, default=3,
-                        help="Number of threads for minimap2.")
-    parser.add_argument("-p", "--processes", type=int, default=10,
-                        help="Number of parallel processes.")
-    parser.add_argument("-c", "--coords", required=True,
-                        help="Input file containing syntenic coordinates.")
-    parser.add_argument("--timer", type=str,
-                        help="Set a timer for each minimap2 process. Format: [int][d/h/m/s].")
-    parser.add_argument("--preset", choices=["asm5", "asm10", "asm20"], default="asm10",
-                        help="minimap2 preset (default: asm10).")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose QC output.")
-    parser.add_argument("-d", "--debug", action="store_true",
-                        help="Debug mode: retain temp files.")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="Extract syntenic segments and align them, emitting PAF.")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("-pairedIDs", nargs="+", help="Accession IDs to include.")
+    group.add_argument("-singleID", help="Single accession ID to include.")
+    p.add_argument("-t", "--threads", type=int, default=3, help="Threads per aligner call.")
+    p.add_argument("-p", "--processes", type=int, default=10, help="Parallel processes.")
+    p.add_argument("-c", "--coords", required=True, help="Syntenic coordinates file.")
+    p.add_argument("--timer", type=str, help="Per-alignment timeout, e.g. 10m.")
+    p.add_argument("--preset", choices=["asm5", "asm10", "asm20"], default="asm10",
+                   help="minimap2 preset (default: asm10).")
+    p.add_argument("--aligner", choices=sorted(BACKENDS), default="minimap2",
+                   help="Alignment backend (default: minimap2).")
+    p.add_argument("--minimap2-bin", default="minimap2",
+                   help="minimap2 binary (default: minimap2 on PATH).")
+    p.add_argument("--max-len-ratio", type=float, default=5.0,
+                   help="Skip segments whose length ratio exceeds this; 0 disables "
+                        "(default: 5.0).")
+    wfa = p.add_argument_group("wfa backend")
+    wfa.add_argument("--wfa-bin", default=None, help="wfa_align binary (default: dev/wavefront/wfa_align).")
+    wfa.add_argument("--wfa-model", choices=["affine", "affine2p"], default="affine2p")
+    wfa.add_argument("--wfa-span", choices=["end2end", "endsfree"], default="end2end")
+    wfa.add_argument("--wfa-memory", choices=["high", "med", "low", "ultralow"],
+                     default="ultralow", help="ultralow = BiWFA (default); required for Mb-scale.")
+    wfa.add_argument("--wfa-heuristic", choices=["none", "adaptive"], default="none",
+                     help="none (default). 'adaptive' is WFA2-lib's own default and costs "
+                          "~14 identity points on 30kb segments -- exposed for benchmarking only.")
+    wfa.add_argument("--no-wfa-chain", dest="wfa_chain", action="store_false",
+                     help="Force ONE global path per segment instead of chaining. An "
+                          "internal inversion then gets reported as a large indel pair "
+                          "(a false TE-indel call) -- benchmarking only.")
+    wfa.add_argument("--min-chain-len", type=int, default=500,
+                     help="Discard colinear chains shorter than this (default: 500).")
+    wfa.add_argument("--min-anchor-len", type=int, default=200,
+                     help="Discard anchor records shorter than this (default: 200).")
+    wfa.add_argument("--wfa-mismatch", type=int, default=6)
+    wfa.add_argument("--wfa-gap-open1", type=int, default=4)
+    wfa.add_argument("--wfa-gap-ext1", type=int, default=2)
+    wfa.add_argument("--wfa-gap-open2", type=int, default=100)
+    wfa.add_argument("--wfa-gap-ext2", type=int, default=1)
 
-    global PRESET, VERBOSE
-    PRESET = args.preset
+    last = p.add_argument_group("last backend")
+    last.add_argument("--last-matrix", default=None, help="lastal -p scoring matrix (e.g. from last-train).")
+    last.add_argument("--last-gap-open", type=int, default=None, help="lastal -a.")
+    last.add_argument("--last-gap-ext", type=int, default=None, help="lastal -b.")
+    last.add_argument("--last-near", action="store_true", help="lastdb -uNEAR (similar sequences).")
+    last.add_argument("--last-split", action="store_true", help="Pipe lastal through last-split.")
+
+    p.add_argument("--output", default="alignment.paf", help="Output PAF.")
+    p.add_argument("--skipped", default="alignment_skipped.tsv",
+                   help="Sidecar listing skipped segments and why.")
+    p.add_argument("--genome-dir", default=".", help="Directory holding <ID>_mod.fa.")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("-d", "--debug", action="store_true", help="Retain temp files.")
+    args = p.parse_args()
+
+    global VERBOSE
     VERBOSE = args.verbose
 
-    output_file = "alignment.paf"
-    log(f"Output file: {output_file}")
+    units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    timer = None
+    if args.timer:
+        if args.timer[-1] not in units:
+            p.error(f"invalid time unit in '{args.timer}'; use d/h/m/s")
+        timer = int(args.timer[:-1]) * units[args.timer[-1]]
 
-    # Download latest minimap2
-    temp_minimap_dir = tempfile.mkdtemp(prefix="minimap2_download_")
-    metadata = subprocess.check_output([
-        "curl", "-s",
-        "https://api.github.com/repos/lh3/minimap2/releases/latest"
-    ], text=True)
-    import json
-    tag = json.loads(metadata)["tag_name"].lstrip("v")
-    tarball = f"minimap2-{tag}_x64-linux.tar.bz2"
-    url = f"https://github.com/lh3/minimap2/releases/download/v{tag}/{tarball}"
-    log(f"Downloading minimap2 v{tag} from {url}")
-    subprocess.run(
-        f"curl -L {url} | tar -jxvf - -C {temp_minimap_dir}",
-        shell=True, check=True
-    )
-    global MINIMAP2_BIN
-    MINIMAP2_BIN = os.path.join(
-        temp_minimap_dir,
-        f"minimap2-{tag}_x64-linux",
-        "minimap2"
-    )
-    log(f"Using minimap2 binary at: {MINIMAP2_BIN}")
-
-    # Read and filter coords
-    with open(args.coords, "r") as f:
-        lines = f.readlines()
+    with open(args.coords) as fh:
+        lines = [l for l in fh if l.strip()]
     filtered = []
     for line in lines:
         syn1, syn2, _ = line.strip().split("\t")
         acc1 = syn1.split(":")[0].split("_")[0]
         acc2 = syn2.split(":")[0].split("_")[0]
-        if args.pairedIDs and (acc1 in args.pairedIDs and acc2 in args.pairedIDs):
+        if args.pairedIDs:
+            if acc1 in args.pairedIDs and acc2 in args.pairedIDs:
+                filtered.append(line)
+        elif args.singleID:
+            if args.singleID in (acc1, acc2):
+                filtered.append(line)
+        else:
             filtered.append(line)
-        elif args.singleID and (acc1 == args.singleID or acc2 == args.singleID):
-            filtered.append(line)
-        elif not args.pairedIDs and not args.singleID:
-            filtered = lines
     total = len(filtered)
-    log(f"Total lines to process: {total}")
+    print(f"Aligning {total} segments with {args.aligner} (preset {args.preset}, "
+          f"max_len_ratio {args.max_len_ratio})")
 
-    # Prepare temp base
-    temp_base = os.path.abspath("./minimap_temp")
+    temp_base = os.path.abspath("./align_temp")
     os.makedirs(temp_base, exist_ok=True)
 
-    # Shared counter for progress
-    manager = Manager()
-    counter = manager.Value('i', 0)
+    opts = {
+        "aligner": args.aligner, "preset": args.preset, "threads": args.threads,
+        "timer": timer, "debug": args.debug, "temp_base": temp_base,
+        "output_file": args.output, "minimap2_bin": args.minimap2_bin,
+        "max_len_ratio": args.max_len_ratio,
+        "wfa_bin": args.wfa_bin, "wfa_model": args.wfa_model, "wfa_span": args.wfa_span,
+        "wfa_memory": args.wfa_memory, "wfa_heuristic": args.wfa_heuristic,
+        "wfa_mismatch": args.wfa_mismatch, "wfa_gap_open1": args.wfa_gap_open1,
+        "wfa_gap_ext1": args.wfa_gap_ext1, "wfa_gap_open2": args.wfa_gap_open2,
+        "wfa_gap_ext2": args.wfa_gap_ext2, "wfa_chain": args.wfa_chain,
+        "min_chain_len": args.min_chain_len, "min_anchor_len": args.min_anchor_len,
+        "last_matrix": args.last_matrix, "last_gap_open": args.last_gap_open,
+        "last_gap_ext": args.last_gap_ext, "last_near": args.last_near,
+        "last_split": args.last_split, "last_threads": args.threads,
+    }
 
-    # Progress reporter thread
-    stop_event = threading.Event()
+    manager = Manager()
+    counter = manager.Value("i", 0)
+    skipped = manager.list()
+
+    stop = threading.Event()
+
     def reporter():
-        iteration = 1
-        while not stop_event.is_set() and counter.value < total:
+        i = 1
+        while not stop.is_set() and counter.value < total:
             time.sleep(60)
             if counter.value >= total:
                 break
-            percent = int((counter.value / total) * 100)
-            print(f"{iteration*1} minute: {percent}% complete")
-            iteration += 1
-    thread = threading.Thread(target=reporter)
-    thread.daemon = True
-    thread.start()
+            print(f"{i} minute: {int(100 * counter.value / total)}% complete")
+            i += 1
 
-    # Launch pool of workers
-    timer_sec = convert_timer_to_seconds(args.timer)
-    tasks = [
-        (line, ".", temp_base, args.threads,
-         output_file, args.debug, timer_sec, counter)
-        for line in filtered
-    ]
+    th = threading.Thread(target=reporter, daemon=True)
+    th.start()
+
+    tasks = [(line, args.genome_dir, opts, counter, skipped) for line in filtered]
     with Pool(processes=args.processes) as pool:
         pool.map(process_line, tasks)
+    stop.set()
 
-    # Signal reporter to stop
-    stop_event.set()
+    if skipped:
+        with open(args.skipped, "w") as fh:
+            fh.write("coord1\tcoord2\tstrand\treason\tratio\tlen1\tlen2\n")
+            for row in skipped:
+                fh.write(row + "\n")
+        from collections import Counter as _C
+        reasons = _C(r.split("\t")[3] for r in skipped)
+        print(f"Skipped {len(skipped)}/{total} segments -> {args.skipped}")
+        for reason, n in reasons.most_common():
+            print(f"    {reason}: {n}")
 
-    # Cleanup
     if not args.debug:
         try:
             os.rmdir(temp_base)
         except OSError:
             pass
-    log(f"Removing downloaded minimap2 directory: {temp_minimap_dir}")
-    shutil.rmtree(temp_minimap_dir)
+
 
 if __name__ == "__main__":
     main()

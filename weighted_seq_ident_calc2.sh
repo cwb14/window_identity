@@ -27,6 +27,16 @@ CSCORE=0.99
 # Synteny block consolidation (see Steps 6-9). Defaults match synLTR/module1.py.
 MIN_BLOCK_SIZE=15000
 STITCH_GAPS="yes"
+# Step 10 alignment. ALIGNER=minimap2 is the historical default and is unchanged.
+ALIGNER="minimap2"
+# block    = span each syntenic block end to end (historical).
+# genepair = span adjacent gene pairs within a block; skips the consolidator, whose 15kb
+#            merge and gap-stitching would undo the finer granularity.
+PARTITION="block"
+# Segments more length-skewed than this are skipped and logged; 0 disables. Borrowed from
+# riparian.py's --max-len-ratio default (its rescue logic is deliberately NOT borrowed --
+# it exists to keep skewed blocks for plot completeness, the opposite of what we want).
+MAX_LEN_RATIO=5
 # Pairwise Ks on the syntenic anchors (Steps 20-21), via ParaAT -> KaKs_Calculator.
 KAKS="yes"
 KAKS_METHOD="YN"
@@ -57,6 +67,14 @@ Options:
   -include_mean_line yes|no    Include mean line in plot (default: $INCLUDE_MEAN_LINE)
   -ymax YMAX                   Y-axis maximum for plot
   -x asm5|asm10|asm20          Sequence divergence mapping for synmap.py (default: $X_TYPE)
+  -aligner minimap2|last|wfa   Step 10 aligner (default: $ALIGNER). 'wfa' is a global
+                               wavefront aligner (BiWFA, no heuristic) that returns one
+                               end-to-end record per segment; 'last' is lastal/last-split.
+  -partition block|genepair    Step 10 segment granularity (default: $PARTITION).
+                               'genepair' spans adjacent gene pairs and skips the
+                               consolidator.
+  -max_len_ratio N             Skip segments whose length ratio exceeds N; 0 disables
+                               (default: $MAX_LEN_RATIO)
   -outn N                      miniprot --outn: max alignments reported per protein
                                (default: $OUTN). Raise for polyploids.
   -outs FLOAT                  miniprot --outs: keep alignments scoring >= this fraction of
@@ -158,6 +176,18 @@ while [[ $# -gt 0 ]]; do
         X_TYPE="$2"
         shift; shift
         ;;
+    -aligner)
+        ALIGNER="$2"
+        shift; shift
+        ;;
+    -partition)
+        PARTITION="$2"
+        shift; shift
+        ;;
+    -max_len_ratio)
+        MAX_LEN_RATIO="$2"
+        shift; shift
+        ;;
     -outn)
         OUTN="$2"
         shift; shift
@@ -242,6 +272,14 @@ fi
 case "$STITCH_GAPS" in
     yes|no) ;;
     *) echo "Error: -stitch_gaps must be 'yes' or 'no' (got '$STITCH_GAPS')."; exit 1 ;;
+esac
+case "$ALIGNER" in
+    minimap2|last|wfa) ;;
+    *) echo "Error: -aligner must be minimap2, last or wfa (got '$ALIGNER')."; exit 1 ;;
+esac
+case "$PARTITION" in
+    block|genepair) ;;
+    *) echo "Error: -partition must be block or genepair (got '$PARTITION')."; exit 1 ;;
 esac
 
 case "$TESORTER" in
@@ -584,8 +622,13 @@ while read -r line; do
     # duplicates must never reach it.
     raw_coords_file="${ID1}.${ID2}.anchors.raw.coords"
     if [[ ! -s "$raw_coords_file" ]]; then
-        echo "Converting $clean_anchor_file to $raw_coords_file"
-        python "$BIN_DIR/gene_coords_extractor_all4.py" -mcscan "$clean_anchor_file" | sort | uniq >"$raw_coords_file"
+        echo "Converting $clean_anchor_file to $raw_coords_file (partition=$PARTITION)"
+        if [[ "$PARTITION" == "genepair" ]]; then
+            extractor="gene_coords_extractor_all4_pairs.py"
+        else
+            extractor="gene_coords_extractor_all4.py"
+        fi
+        python "$BIN_DIR/$extractor" -mcscan "$clean_anchor_file" | sort | uniq >"$raw_coords_file"
     else
         echo "Raw coords file $raw_coords_file exists. Skipping."
     fi
@@ -603,8 +646,15 @@ while read -r line; do
         echo "Polishing $polished_file (pass 2 -> $polished2_file)"
         python "$BIN_DIR/anchor_coord_subtracter.py" "$polished_file" "$polished2_file"
 
-        echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS)"
-        python "$BIN_DIR/anchor_coord_consolidator.py" "${CONSOLIDATOR_OPTS[@]}" "$polished2_file" >"$coords_file"
+        if [[ "$PARTITION" == "genepair" ]]; then
+            # The consolidator merges to >=MIN_BLOCK_SIZE and stitches gaps, which would
+            # rebuild the very blocks gene-pair partitioning exists to avoid.
+            echo "Partition=genepair: skipping the consolidator, using $polished2_file as-is"
+            cp "$polished2_file" "$coords_file"
+        else
+            echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS)"
+            python "$BIN_DIR/anchor_coord_consolidator.py" "${CONSOLIDATOR_OPTS[@]}" "$polished2_file" >"$coords_file"
+        fi
     else
         echo "Coords file $coords_file exists. Skipping."
     fi
@@ -634,7 +684,9 @@ fi
 # Step 10 - Align the genomic anchors
 if [[ ! -s "alignment.paf" ]]; then
     echo "Step 10 - Align the genomic anchors"
-    python -u "$BIN_DIR/synmap_split.py" --timer 10m -t "$THREADS" -p "$PROCESSES" --preset "$X_TYPE" -c all.anchors.coords.polished
+    python -u "$BIN_DIR/synmap_split.py" --timer 10m -t "$THREADS" -p "$PROCESSES" \
+        --preset "$X_TYPE" --aligner "$ALIGNER" --max-len-ratio "$MAX_LEN_RATIO" \
+        -c all.anchors.coords.polished
     # I can use 'paftools.js view' to visualize aln quality and optimize parameters.
     # The minimap2 parameters likely need optimized since k2p seems off.
 else

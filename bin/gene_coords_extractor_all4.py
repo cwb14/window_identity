@@ -23,11 +23,45 @@ def get_gene_coords(merged_data):
         if len(parts) < 4:
             continue
         chrom, start, end, geneID = parts[0], parts[1], parts[2], parts[3]
+        if len(parts) < 6 or parts[5] not in ("+", "-"):
+            found = repr(parts[5]) if len(parts) >= 6 else "column absent"
+            raise ValueError(
+                f"BED record for gene '{geneID}' has no usable strand in column 6 "
+                f"({found}). Gene strand determines block orientation; silently defaulting "
+                f"it would mislabel blocks the same way the old gene-order rule did. "
+                f"Regenerate the BED with strand."
+            )
         try:
-            gene_coords[geneID] = (chrom, int(start), int(end))
+            gene_coords[geneID] = (chrom, int(start), int(end), parts[5])
         except ValueError:
             continue
     return gene_coords
+
+
+def directionality(coords_1, coords_2, coords_3, coords_4):
+    """Orientation of the species-2 span relative to the species-1 span.
+
+    Determined from the relative strand of each orthologous gene pair: an ortholog on the
+    opposite strand means the local sequence is reverse-complemented, so this measures
+    orientation directly and locally.
+
+    This replaces a gene-ORDER rule, which was wrong two ways. It compared start positions
+    with '<', so consecutive anchors at the same locus (duplicate gene models -- 756 of 6036
+    rows on the Atha/Alyr pair) tied, silently resolved to '-', and FLIPPED the label. And
+    even without a tie it disagreed with the sequence on tandem paralogs and short spans,
+    where which paralog an anchor picked is arbitrary.
+
+    Measured against 15-mer ground truth (step10_dev/): gene strand 219/219 = 100%,
+    gene order 84-87%. Adjacent anchors agree with each other on 99.3% of rows.
+
+    Returns '+', '-', or None when the two anchors disagree -- the span straddles an
+    inversion boundary and has no single correct orientation.
+    """
+    same_1 = coords_1[3] == coords_2[3]
+    same_2 = coords_3[3] == coords_4[3]
+    if same_1 != same_2:
+        return None
+    return "+" if same_1 else "-"
 
 def read_gene_ids_file(gene_ids_filename):
     clusters = []
@@ -51,6 +85,7 @@ def read_gene_ids_file(gene_ids_filename):
 
 def process_clusters(clusters, gene_coords):
     output_strings = []
+    n_straddle = 0
     for cluster in clusters:
         for i in range(len(cluster) - 1):
             g1a, g1b = cluster[i][0], cluster[i][1]
@@ -66,14 +101,22 @@ def process_clusters(clusters, gene_coords):
             coords_3 = gene_coords[g2a]
             coords_4 = gene_coords[g2b]
 
-            direction_1 = "+" if coords_1[1] < coords_3[1] else "-"
-            direction_2 = "+" if coords_2[1] < coords_4[1] else "-"
-            directionality = "+" if direction_1 == direction_2 else "-"
+            strand = directionality(coords_1, coords_2, coords_3, coords_4)
+            if strand is None:
+                # Anchors disagree: the span crosses an inversion boundary, so no single
+                # orientation is right. Take the first anchor's call and let the aligner's
+                # sequence-level orientation check settle it.
+                strand = "+" if coords_1[3] == coords_2[3] else "-"
+                n_straddle += 1
 
             left_span = f"{coords_1[0]}:{min(coords_1[1], coords_3[1])}..{max(coords_1[2], coords_3[2])}"
             right_span = f"{coords_2[0]}:{min(coords_2[1], coords_4[1])}..{max(coords_2[2], coords_4[2])}"
 
-            output_strings.append(f"{left_span}\t{right_span}\t{directionality}")
+            output_strings.append(f"{left_span}\t{right_span}\t{strand}")
+    if n_straddle:
+        print(f"NOTE: {n_straddle} of {len(output_strings)} spans straddle an inversion "
+              f"boundary (the two anchors disagree on orientation); used the first anchor's "
+              f"call", file=sys.stderr)
     return output_strings
 
 def parse_species_from_mcscan(mcscan_filename):
