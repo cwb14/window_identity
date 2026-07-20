@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import fastaio
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Calculate divergence and K2P weights from PAF alignments.")
@@ -29,11 +30,15 @@ def process_paf_line(fields):
     query_name = fields[0]
     target_name = fields[5]
 
-    query_accession_name = query_name.split('_')[0]
-    target_accession_name = target_name.split('_')[0]
+    _ids = fastaio.genome_ids()
+    query_accession_name = fastaio.accession_of(query_name, _ids)
+    target_accession_name = fastaio.accession_of(target_name, _ids)
 
+    # A trailing sd:Z: segment tag may be present (added by paf_emit for resume support).
+    # Anchor the positional read against the end of the *untagged* row.
+    tail = fields[:-1] if fields[-1].startswith("sd:Z:") else fields
     try:
-        line_match_and_mismatch = float(fields[-2])
+        line_match_and_mismatch = float(tail[-2])
     except ValueError:
         return None
 

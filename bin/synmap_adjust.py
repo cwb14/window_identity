@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import argparse
+import fastaio
 
 def parse_fai(fai_file):
     lengths = {}
@@ -26,7 +27,7 @@ def ensure_fai(fasta_file):
 
 def infer_fasta_name(seq_name):
     # Infer fasta filename from the sequence name prefix
-    fasta_name = seq_name.split('_')[0] + "_mod.fa"
+    fasta_name = fastaio.accession_of(seq_name, fastaio.genome_ids()) + "_mod.fa"
     return fasta_name
 
 def process_paf(paf_file):

@@ -14,6 +14,7 @@ PROCESSES=4
 INCLUDE_MEAN_LINE="no"
 YMAX=""
 NAMES=""
+OUTDIR=""
 REF=""
 QUERY_GENOMES=()
 # Divergence mapping option for synmap.py
@@ -29,6 +30,13 @@ MIN_BLOCK_SIZE=15000
 STITCH_GAPS="yes"
 # Step 10 alignment. ALIGNER=minimap2 is the historical default and is unchanged.
 ALIGNER="minimap2"
+# Steps 10-19 (alignment and everything that reads the PAF). 'no' keeps Steps 1-9, the Ks
+# branch, and the riparian plot, all of which read only the anchors.
+ALIGN="yes"
+# Reuse complete outputs found in the output directory. The per-step guards below are what
+# implement this; -resume no bypasses them and recomputes. Step 10 additionally resumes at
+# segment granularity, so a killed alignment salvages the work it finished.
+RESUME="yes"
 # block    = span each syntenic block end to end (historical).
 # genepair = span adjacent gene pairs within a block; skips the consolidator, whose 15kb
 #            merge and gap-stitching would undo the finer granularity.
@@ -42,6 +50,8 @@ KAKS="yes"
 KAKS_METHOD="YN"
 KS_RATE=1.5e-8
 KS_MAX=2.0
+# Step 22. Reads only the per-pair anchors and the FAI, so it runs regardless of -align.
+RIPARIAN="yes"
 
 # Help menu function
 usage() {
@@ -64,12 +74,24 @@ Options:
   -processes N                 Number of processes (default: $PROCESSES)
   -mutation_rate RATE          Mutation rate (default: $MUTATION_RATE)
   -names STRING                Names key file
+  -outdir DIR                  Output directory (default: <ref>_<queries>_window_identity).
+                               Created if absent; all outputs are written inside it.
   -include_mean_line yes|no    Include mean line in plot (default: $INCLUDE_MEAN_LINE)
   -ymax YMAX                   Y-axis maximum for plot
   -x asm5|asm10|asm20          Sequence divergence mapping for synmap.py (default: $X_TYPE)
   -aligner minimap2|last|wfa   Step 10 aligner (default: $ALIGNER). 'wfa' is a global
                                wavefront aligner (BiWFA, no heuristic) that returns one
                                end-to-end record per segment; 'last' is lastal/last-split.
+  -align yes|no                Run the alignment and everything downstream of it, i.e.
+                               Steps 10-19 (default: $ALIGN). 'no' still builds the anchors
+                               (Steps 1-9), the Ks tree (-kaks yes), and the riparian plot.
+                               The alignment dominates runtime, so use this when only the
+                               synteny/Ks products are needed.
+  -resume yes|no               Reuse existing complete outputs in the output directory
+                               (default: $RESUME). The alignment resumes per segment: a
+                               killed run keeps every segment it finished and aligns only
+                               the remainder. 'no' recomputes every step, overwriting
+                               outputs in place.
   -partition block|genepair    Step 10 segment granularity (default: $PARTITION).
                                'genepair' spans adjacent gene pairs and skips the
                                consolidator.
@@ -113,6 +135,9 @@ Options:
                                genome-wide nucleotide rate and calibrates the K2P tree.
   -ks_max FLOAT                Drop gene pairs with Ks >= this before taking the median
                                (default: $KS_MAX). Above ~2, Ks is saturated and unstable.
+  -riparian yes|no             Draw the syntenic ribbon (riparian) plot as the final step
+                               (default: $RIPARIAN). Reads the per-pair anchors, so it is
+                               unaffected by -align no.
   -h, --help                   Show this help message and exit
 EOF
 }
@@ -164,6 +189,10 @@ while [[ $# -gt 0 ]]; do
         NAMES="$2"
         shift; shift
         ;;
+    -outdir)
+        OUTDIR="$2"
+        shift; shift
+        ;;
     -include_mean_line)
         INCLUDE_MEAN_LINE="$2"
         shift; shift
@@ -178,6 +207,14 @@ while [[ $# -gt 0 ]]; do
         ;;
     -aligner)
         ALIGNER="$2"
+        shift; shift
+        ;;
+    -align)
+        ALIGN="$2"
+        shift; shift
+        ;;
+    -resume)
+        RESUME="$2"
         shift; shift
         ;;
     -partition)
@@ -232,6 +269,10 @@ while [[ $# -gt 0 ]]; do
         KS_MAX="$2"
         shift; shift
         ;;
+    -riparian)
+        RIPARIAN="$2"
+        shift; shift
+        ;;
     *)
         echo "Error: Unknown option $1"
         usage
@@ -272,6 +313,18 @@ fi
 case "$STITCH_GAPS" in
     yes|no) ;;
     *) echo "Error: -stitch_gaps must be 'yes' or 'no' (got '$STITCH_GAPS')."; exit 1 ;;
+esac
+case "$ALIGN" in
+    yes|no) ;;
+    *) echo "Error: -align must be 'yes' or 'no' (got '$ALIGN')."; exit 1 ;;
+esac
+case "$RESUME" in
+    yes|no) ;;
+    *) echo "Error: -resume must be 'yes' or 'no' (got '$RESUME')."; exit 1 ;;
+esac
+case "$RIPARIAN" in
+    yes|no) ;;
+    *) echo "Error: -riparian must be 'yes' or 'no' (got '$RIPARIAN')."; exit 1 ;;
 esac
 case "$ALIGNER" in
     minimap2|last|wfa) ;;
@@ -398,6 +451,69 @@ if [[ ${#_dupe_ids[@]} -gt 0 ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------- output directory
+#
+# Every step below writes bare relative filenames, and the Python helpers resolve their
+# inputs against the CWD. So rather than thread an output prefix through ~200 call sites,
+# resolve the user's paths to absolute and cd once. SCRIPT_DIR/BIN_DIR are already absolute.
+REF=$(readlink -f "$REF")
+for i in "${!QUERY_GENOMES[@]}"; do
+    QUERY_GENOMES[$i]=$(readlink -f "${QUERY_GENOMES[$i]}")
+done
+PROTEIN=$(readlink -f "$PROTEIN")
+[[ -n "$NAMES" ]] && NAMES=$(readlink -f "$NAMES")
+
+# GENOME_IDS is keyed by the ORIGINAL paths, which have just been rewritten. Rebuild it.
+ALL_GENOMES=("$REF" "${QUERY_GENOMES[@]}")
+unset GENOME_IDS
+declare -A GENOME_IDS
+for genome in "${ALL_GENOMES[@]}"; do
+    GENOME_IDS["$genome"]=$(fasta_stem "$genome")
+done
+
+if [[ -z "$OUTDIR" ]]; then
+    _ref_id="${GENOME_IDS[$REF]}"
+    _qry_ids=""
+    for genome in "${QUERY_GENOMES[@]}"; do
+        _qry_ids+="${_qry_ids:+-}${GENOME_IDS[$genome]}"
+    done
+    OUTDIR="${_ref_id}_${_qry_ids}_window_identity"
+    # Joined query names get unwieldy fast, and most filesystems cap a component at 255.
+    if [[ ${#OUTDIR} -gt 100 ]]; then
+        OUTDIR="${_ref_id}_${#QUERY_GENOMES[@]}queries_window_identity"
+    fi
+fi
+
+if ! mkdir -p "$OUTDIR"; then
+    echo "Error: could not create output directory: $OUTDIR" >&2
+    exit 1
+fi
+cd "$OUTDIR" || { echo "Error: could not enter output directory: $OUTDIR" >&2; exit 1; }
+echo "Output directory: $(pwd)"
+
+# Guard against directory reuse across different genome sets. The default OUTDIR name
+# only encodes the query COUNT once it falls back to its short form (above), so two runs
+# sharing a reference and query count but different query genomes collide on the same
+# directory -- and an explicit -outdir can collide on any two runs regardless of naming.
+# Every downstream intermediate (jcvi_list.txt, alignment.paf, merged.weighted_de_avg.bed,
+# ks_genome.tsv, ...) is a bare per-directory filename, so a collision would silently
+# reuse the wrong run's cached data via the "exists. Skipping." guards below rather than
+# error. genome_list.txt -- one bare genome ID per line, written by fasta_renamer_diploid.py
+# in Step 1 -- is the witness: it needs no parsing beyond a line read, unlike jcvi_list.txt,
+# which encodes the same genomes only indirectly as pairwise combinations. Missing/empty
+# means no prior run: proceed silently.
+if [[ -s genome_list.txt ]]; then
+    mapfile -t _prev_ids < <(sort -u genome_list.txt)
+    mapfile -t _curr_ids < <(printf '%s\n' "${GENOME_IDS[@]}" | sort -u)
+    if [[ "${_prev_ids[*]}" != "${_curr_ids[*]}" ]]; then
+        echo "Error: $OUTDIR already contains a run with a different genome set."
+        echo "       Found:     ${_prev_ids[*]}"
+        echo "       Requested: ${_curr_ids[*]}"
+        echo "       Pass a different -outdir, or remove/rename the existing directory."
+        exit 1
+    fi
+fi
+
 # The liftover renames its per-genome peptides to '{id}.pep' (see Steps 2-4). If the
 # reference proteome is itself named '{id}.pep' for one of the genomes -- '-ref Athal.fa
 # -peptide Athal.pep' -- that rename overwrites the reference with the lifted-over peptides.
@@ -422,6 +538,11 @@ if ! python "$BIN_DIR/fasta_renamer_diploid.py" --preflight -genomes "${ALL_GENO
     exit 1
 fi
 
+# A step should run when its output is missing/empty, or when the user asked to recompute.
+need_run() {
+    [[ "$RESUME" == "no" ]] && return 0
+    [[ ! -s "$1" ]]
+}
 
 # Step 1 - Cleanup the input genome file
 modified_fastas_exist=true
@@ -436,6 +557,8 @@ done
 if [[ ! -s "jcvi_list.txt" ]]; then
     modified_fastas_exist=false
 fi
+
+[[ "$RESUME" == "no" ]] && modified_fastas_exist=false
 
 if [[ "$modified_fastas_exist" = false ]]; then
     echo "Step 1 - Cleanup the input genome file."
@@ -476,6 +599,8 @@ for genome in "${ALL_GENOMES[@]}"; do
         fi
     done
 done
+
+[[ "$RESUME" == "no" ]] && liftover_outputs_exist=false
 
 if [[ "$liftover_outputs_exist" = false ]]; then
     echo "Steps 2-4 - Liftover $PROTEIN onto each genome (tesorter=$TESORTER, kaks=$KAKS)"
@@ -526,6 +651,8 @@ for anchor_file in "${expected_anchor_files[@]}"; do
         break
     fi
 done
+
+[[ "$RESUME" == "no" ]] && anchors_exist=false
 
 if [[ "$anchors_exist" = false ]]; then
     # --prot anchors on the lifted-over peptides via diamond_blastp (--dbtype prot) rather than
@@ -609,7 +736,7 @@ while read -r line; do
     clean_anchor_file="${ID1}.${ID2}.clean.anchors"
 
     # Step 6 - Clean the anchor files
-    if [[ ! -s "$clean_anchor_file" ]]; then
+    if need_run "$clean_anchor_file"; then
         echo "Cleaning $anchor_file to $clean_anchor_file"
         python "$BIN_DIR/anchor_builder.py" "$anchor_file" >"$clean_anchor_file"
     else
@@ -621,7 +748,7 @@ while read -r line; do
     # lines as containing the other and removes BOTH, silently deleting the block. Exact
     # duplicates must never reach it.
     raw_coords_file="${ID1}.${ID2}.anchors.raw.coords"
-    if [[ ! -s "$raw_coords_file" ]]; then
+    if need_run "$raw_coords_file"; then
         echo "Converting $clean_anchor_file to $raw_coords_file (partition=$PARTITION)"
         if [[ "$PARTITION" == "genepair" ]]; then
             extractor="gene_coords_extractor_all4_pairs.py"
@@ -637,7 +764,7 @@ while read -r line; do
     polished_file="${ID1}.${ID2}.anchors.coords.polished"
     polished2_file="${ID1}.${ID2}.anchors.coords.polished2"
     coords_file="${ID1}.${ID2}.anchors.coords"
-    if [[ ! -s "$coords_file" ]]; then
+    if need_run "$coords_file"; then
         echo "Polishing $raw_coords_file (pass 1 -> $polished_file)"
         python "$BIN_DIR/anchor_coord_subtracter.py" "$raw_coords_file" "$polished_file"
 
@@ -667,7 +794,7 @@ done <jcvi_list.txt
 # pair, so polishing per-pair and merging is equivalent to polishing the merged file -- but
 # it keeps the O(n^2) polish on small per-pair inputs.
 POLISHED="all.anchors.coords.polished"
-if [[ ! -s "$POLISHED" ]]; then
+if need_run "$POLISHED"; then
     coords_files=()
     while read -r line; do
         ID1=$(echo "$line" | awk '{print $1}')
@@ -681,20 +808,37 @@ else
     echo "Step 9 - Polished coords file $POLISHED exists. Skipping."
 fi
 
-# Step 10 - Align the genomic anchors
+# GENOME_IDS already holds the stem; do not strip again, or a dotted ID loses its tail.
+REF_ID="${GENOME_IDS[$REF]}"
+
+if [[ "$ALIGN" == "yes" ]]; then
+
+# Step 10 - Align the genomic anchors.
+#
+# synmap_split.py appends to alignment.paf as each segment finishes and, under --resume,
+# skips segments already recorded in alignment.paf or alignment_skipped.tsv. The old
+# '[[ ! -s alignment.paf ]]' guard was actively harmful: a killed Step 10 leaves a partial
+# non-empty PAF, and the guard would report "Skipping" and let Steps 11-19 run on a
+# silently truncated alignment.
+echo "Step 10 - Align the genomic anchors"
+synmap_split_opts=(--timer 10m -t "$THREADS" -p "$PROCESSES"
+                   --preset "$X_TYPE" --aligner "$ALIGNER"
+                   --max-len-ratio "$MAX_LEN_RATIO"
+                   -c all.anchors.coords.polished)
+if [[ "$RESUME" == "yes" ]]; then
+    synmap_split_opts+=(--resume)
+fi
+if ! python -u "$BIN_DIR/synmap_split.py" "${synmap_split_opts[@]}"; then
+    echo "Error: Step 10 (synmap_split.py) failed. Not continuing to Step 11 on a partial alignment." >&2
+    exit 1
+fi
 if [[ ! -s "alignment.paf" ]]; then
-    echo "Step 10 - Align the genomic anchors"
-    python -u "$BIN_DIR/synmap_split.py" --timer 10m -t "$THREADS" -p "$PROCESSES" \
-        --preset "$X_TYPE" --aligner "$ALIGNER" --max-len-ratio "$MAX_LEN_RATIO" \
-        -c all.anchors.coords.polished
-    # I can use 'paftools.js view' to visualize aln quality and optimize parameters.
-    # The minimap2 parameters likely need optimized since k2p seems off.
-else
-    echo "Step 10 - alignment.paf exists. Skipping."
+    echo "Error: Step 10 produced no alignments. Check alignment_skipped.tsv." >&2
+    exit 1
 fi
 
 # Step 11 - Adjust the PAF coordinates, calculate the weighted divergence, and build the tree
-if [[ ! -s "alignment_adjust.paf" ]]; then
+if need_run "alignment_adjust.paf"; then
     echo "Adjusting alignment.paf to alignment_adjust.paf"
     python "$BIN_DIR/synmap_adjust.py" -paf alignment.paf | \
     awk '{for(i=1;i<=NF;i++) if($i ~ /^cg:Z:/){c=substr($i,6);s=0; while(match(c,/([0-9]+)M/,a)){s+=a[1];c=substr(c,RSTART+RLENGTH)}; print $0 "\t" s}}' | \
@@ -705,14 +849,14 @@ else
     echo "alignment_adjust.paf exists. Skipping."
 fi
 
-if [[ ! -s "alignment_adjust.tsv" ]]; then
+if need_run "alignment_adjust.tsv"; then
     echo "Calculating weighted divergence"
     python "$BIN_DIR/weighted_paf.py" -paf alignment_adjust.paf
 else
     echo "alignment_adjust.tsv exists. Skipping."
 fi
 
-if [[ ! -s "alignment_genome.tsv" ]]; then
+if need_run "alignment_genome.tsv"; then
     echo "Calculating weighted averages"
     python "$BIN_DIR/weighted_average3.py" -input alignment_de.tsv -chrom_out de_chrom.tsv -genome_out de_genome.tsv
     python "$BIN_DIR/weighted_average3.py" -input alignment_k2p.tsv -chrom_out k2p_chrom.tsv -genome_out k2p_genome.tsv
@@ -720,7 +864,7 @@ else
     echo "alignment_genome.tsv exists. Skipping."
 fi
 
-if [[ ! -s "ANI_matrix.tsv" ]]; then
+if need_run "ANI_matrix.tsv"; then
     echo "Building the matrix"
     python "$BIN_DIR/matrix_builder.py" -in de_genome.tsv > de_matrix.tsv
     python "$BIN_DIR/matrix_builder.py" -in k2p_genome.tsv > k2p_matrix.tsv
@@ -729,9 +873,6 @@ else
 fi
 
 # Step 12 - Subset the alignment file according to the reference
-# GENOME_IDS already holds the stem; do not strip again, or a dotted ID loses its tail.
-REF_ID="${GENOME_IDS[$REF]}"
-
 subset_pafs_exist=true
 for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
@@ -741,6 +882,8 @@ for genome in "${QUERY_GENOMES[@]}"; do
         break
     fi
 done
+
+[[ "$RESUME" == "no" ]] && subset_pafs_exist=false
 
 if [[ "$subset_pafs_exist" = false ]]; then
     echo "Step 12 - Subsetting alignment file according to the reference"
@@ -756,7 +899,7 @@ if [[ ! -s "${REF_ID}_mod.fa.fai" ]]; then
 fi
 
 window_file="${REF_ID}_mod.window"
-if [[ ! -s "$window_file" ]]; then
+if need_run "$window_file"; then
     echo "Building window file for $REF_ID"
     bedtools makewindows -g <(cut -f 1,2 "${REF_ID}_mod.fa.fai") -w "$WINDOW_SIZE" -s "$SLIDE_SIZE" >"$window_file"
 else
@@ -768,7 +911,7 @@ for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
     bed_file="${REF_ID}.${QUERY_ID}.bed"
     output_tsv="${REF_ID}.${QUERY_ID}.tsv"
-    if [[ ! -s "$output_tsv" ]]; then
+    if need_run "$output_tsv"; then
         echo "Calculating weights for $bed_file"
         python "$BIN_DIR/weighted_de_scores.py" -window_bed "${REF_ID}_mod.window" -minimap_bed "$bed_file" -output "$output_tsv" --threads "$THREADS"
     else
@@ -781,7 +924,7 @@ for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
     input_tsv="${REF_ID}.${QUERY_ID}.tsv"
     avg_tsv="${REF_ID}.${QUERY_ID}.avg.tsv"
-    if [[ ! -s "$avg_tsv" ]]; then
+    if need_run "$avg_tsv"; then
         echo "Calculating weighted average for $input_tsv"
         python "$BIN_DIR/weighted_de_average.py" "$input_tsv" "${QUERY_ID}" >"$avg_tsv"
     else
@@ -794,7 +937,7 @@ for genome in "${QUERY_GENOMES[@]}"; do
     QUERY_ID="${GENOME_IDS[$genome]}"
     bed_file="${REF_ID}.${QUERY_ID}.bed"
     chrom_report="${REF_ID}.${QUERY_ID}.chrom.tsv" # Assuming the script generates output with this name
-    if [[ ! -s "$chrom_report" ]]; then
+    if need_run "$chrom_report"; then
         echo "Generating per-chromosome divergence report for $bed_file"
         python "$BIN_DIR/weighted_de_chroms.py" -bed "$bed_file" -fai "${REF_ID}_mod.fa.fai" > "$chrom_report"
     else
@@ -811,7 +954,7 @@ for genome in "${QUERY_GENOMES[@]}"; do
 done
 
 merged_file="merged.weighted_de_avg.bed"
-if [[ ! -s "$merged_file" ]]; then
+if need_run "$merged_file"; then
     echo "Merging weighted averages for plotting"
     python "$BIN_DIR/window_merger.py" "${avg_tsv_files[@]}" -o "$merged_file"
 else
@@ -841,10 +984,11 @@ fi
 echo "Running: $upgma_cmd"
 eval "$upgma_cmd"
 
-if [[ "$KAKS" != "yes" ]]; then
-    echo "Steps 20-21 - Ks estimation disabled (-kaks no). Done."
-    exit 0
+else
+    echo "Steps 10-19 - Alignment disabled (-align no). Skipping the PAF branch."
 fi
+
+if [[ "$KAKS" == "yes" ]]; then
 
 # Step 20 - Pairwise Ks on the syntenic anchors (ParaAT -> KaKs_Calculator).
 #
@@ -886,7 +1030,7 @@ while read -r line; do
     ID2=$(echo "$line" | awk '{print $2}')
     kaks_tsv="${ID1}.${ID2}.kaks.tsv"
 
-    if [[ -s "$kaks_tsv" ]]; then
+    if ! need_run "$kaks_tsv"; then
         echo "Ks table $kaks_tsv exists. Skipping."
         continue
     fi
@@ -930,7 +1074,7 @@ while read -r line; do
 done <jcvi_list.txt
 
 # Step 21 - Summarise Ks, then build the density plot, distance matrix, and tree.
-if [[ ! -s "ks_genome.tsv" ]]; then
+if need_run "ks_genome.tsv"; then
     echo "Step 21 - Summarising Ks (median per genome pair, 0 < Ks < $KS_MAX)"
     python "$BIN_DIR/ks_summary.py" \
         -list jcvi_list.txt \
@@ -941,7 +1085,7 @@ else
     echo "Step 21 - ks_genome.tsv exists. Skipping."
 fi
 
-if [[ ! -s "ks_matrix.tsv" ]]; then
+if need_run "ks_matrix.tsv"; then
     echo "Building the Ks matrix"
     python "$BIN_DIR/matrix_builder.py" -in ks_genome.tsv >ks_matrix.tsv
 else
@@ -962,3 +1106,53 @@ if [[ -n "$NAMES" ]]; then
 fi
 echo "Running: $ks_tree_cmd"
 eval "$ks_tree_cmd"
+
+else
+    echo "Steps 20-21 - Ks estimation disabled (-kaks no). Skipping."
+fi
+
+# Step 22 - Syntenic ribbon (riparian) plot.
+#
+# Reads the per-pair consolidated anchors and one FAI per genome, so it is independent of
+# the alignment branch and runs under -align no. '*.anchors.coords' is already exactly
+# riparian's --coords format ('seq:start..end<TAB>seq:start..end<TAB>strand').
+if [[ "$RIPARIAN" == "yes" ]]; then
+    if ! need_run "riparian.pdf"; then
+        echo "Step 22 - riparian.pdf exists. Skipping."
+    else
+        echo "Step 22 - Building the riparian plot"
+
+        # Every genome needs a FAI. Step 13 indexes the reference only, and is skipped
+        # entirely under -align no.
+        for genome in "${ALL_GENOMES[@]}"; do
+            id="${GENOME_IDS[$genome]}"
+            if [[ ! -s "${id}_mod.fa.fai" ]]; then
+                echo "Indexing ${id}_mod.fa"
+                samtools faidx "${id}_mod.fa"
+            fi
+        done
+
+        riparian_coords=()
+        while read -r line; do
+            ID1=$(echo "$line" | awk '{print $1}')
+            ID2=$(echo "$line" | awk '{print $2}')
+            riparian_coords+=("${ID1}.${ID2}.anchors.coords")
+        done <jcvi_list.txt
+
+        # Reference first: riparian takes its ribbon colours from the first genome.
+        riparian_fais=("${REF_ID}_mod.fa.fai")
+        riparian_order="$REF_ID"
+        for genome in "${QUERY_GENOMES[@]}"; do
+            riparian_fais+=("${GENOME_IDS[$genome]}_mod.fa.fai")
+            riparian_order+=",${GENOME_IDS[$genome]}"
+        done
+
+        echo "Running: python $BIN_DIR/riparian.py --coords ${riparian_coords[*]} --fai ${riparian_fais[*]} --order $riparian_order --scale bp -o riparian"
+        python "$BIN_DIR/riparian.py" \
+            --coords "${riparian_coords[@]}" \
+            --fai "${riparian_fais[@]}" \
+            --order "$riparian_order" \
+            --scale bp \
+            -o riparian
+    fi
+fi

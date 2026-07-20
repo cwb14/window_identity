@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import fastaio
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Convert PAF to BED-like files based on a reference ID.")
@@ -11,9 +12,9 @@ def parse_arguments():
 
 def extract_nonid(column):
     """
-    Extracts the nonID part from a column by taking the substring before the first underscore.
+    Recover the genome ID from a sequence name, resolving against the canonical list.
     """
-    return column.split('_')[0] if '_' in column else column
+    return fastaio.accession_of(column, fastaio.genome_ids())
 
 def process_paf(ref_id, paf_file):
     """

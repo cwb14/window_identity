@@ -10,6 +10,7 @@ import argparse
 import math
 from collections import defaultdict
 import glob
+import fastaio
 
 def is_transition(ref_base, query_base):
     ref_base = ref_base.upper()
@@ -61,8 +62,9 @@ def main():
             QUERY_SEQ = fields[4]  # 5th column is the query allele
             QUERY_ID = fields[5]  # 6th column is the query contig
 
-            REF_GENOME = REF_ID.split('_')[0]
-            QUERY_GENOME = QUERY_ID.split('_')[0]
+            _ids = fastaio.genome_ids()
+            REF_GENOME = fastaio.accession_of(REF_ID, _ids)
+            QUERY_GENOME = fastaio.accession_of(QUERY_ID, _ids)
 
             genomes.update([REF_GENOME, QUERY_GENOME])
 

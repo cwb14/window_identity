@@ -23,12 +23,30 @@ across all sampled records:
     invariant: count(I in cg) == count('+' in cs);  count(D) == count('-')
 """
 
+import hashlib
 from dataclasses import dataclass
 from typing import List, Tuple
 
 # Op vocabulary used by every backend. I = query has extra bases relative to target
 # (minimap2 'I' / cs '+'); D = target has extra bases (minimap2 'D' / cs '-').
 OPS = ("=", "X", "I", "D")
+
+# Tag carrying the segment identity, appended as the FINAL field of every emitted row.
+# It MUST stay last: this module's contract (see the docstring above) is that de:f: sits at
+# 1-based column 21, because paf_to_bed.py reads columns[20] positionally with no tag-name
+# check. Appending is safe; inserting anywhere earlier silently corrupts every divergence
+# value in the run.
+SEG_TAG = "sd:Z:"
+
+
+def segment_id(coord1: str, coord2: str, strand: str) -> str:
+    """Deterministic 12-hex-char ID for one coords line.
+
+    blake2b rather than hash(): the builtin is salted per process, so a resume in a second
+    invocation would compute different IDs and re-align everything.
+    """
+    key = f"{coord1}|{coord2}|{strand}".encode()
+    return hashlib.blake2b(key, digest_size=6).hexdigest()
 
 
 @dataclass
@@ -46,6 +64,7 @@ class Segment:
     q_start: int
     q_end: int
     q_revcomp: bool  # whether the SUBMITTED query was reverse-complemented
+    seg_id: str = ""  # paf_emit.segment_id() of the source coords line; "" when unknown
 
     @property
     def t_len(self) -> int:
@@ -192,6 +211,8 @@ def format_paf(rec: AlnRecord, seg: Segment, tseq: str, qseq: str) -> str:
         f"de:f:{de:.4f}", "rl:i:0",
         f"cg:Z:{cg}", f"cs:Z:{cs}",
     ]
+    if seg.seg_id:
+        cols.append(f"{SEG_TAG}{seg.seg_id}")
     return "\t".join(cols)
 
 
@@ -212,4 +233,6 @@ def shift_native_paf(line: str, seg: Segment) -> str:
     q_ps, q_pe, t_ps, t_pe, strand = map_to_parent(rec, seg)
     cols[2], cols[3], cols[4] = str(q_ps), str(q_pe), strand
     cols[7], cols[8] = str(t_ps), str(t_pe)
+    if seg.seg_id:
+        cols.append(f"{SEG_TAG}{seg.seg_id}")
     return "\t".join(cols)

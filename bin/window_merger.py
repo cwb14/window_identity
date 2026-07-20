@@ -3,7 +3,6 @@
 
 import pandas as pd
 import argparse
-import sys
 
 def merge_bed_files(bed_files):
     """
@@ -59,12 +58,11 @@ def main():
     
     # Parse arguments.
     args = parser.parse_args()
-    
-    # Check if at least two files are provided.
-    if len(args.bed_files) < 2:
-        print("Error: Please provide at least two BED files to merge.", file=sys.stderr)
-        sys.exit(1)
-    
+
+    # A single input is legitimate: a 1v1 comparison has nothing to merge, and the lone
+    # avg.tsv already carries exactly the header divergence_plotter.R reads. argparse
+    # nargs='+' guarantees at least one file, so no lower bound is needed here.
+
     # Merge the bed files.
     merged_df = merge_bed_files(args.bed_files)
     

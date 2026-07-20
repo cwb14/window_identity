@@ -12,6 +12,10 @@ from multiprocessing import Pool, Manager
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import fastaio
+
 # Global variables
 MINIMAP2_BIN = None
 PRESET = "asm10"
@@ -27,7 +31,8 @@ def extract_sequence(fasta_file, syncoord, reverse_complement=False):
     try:
         accession_seqid, pos_range = syncoord.split(":")
         start, end = map(int, pos_range.split(".."))
-        accession_id, seqid = accession_seqid.split("_")
+        seqid = accession_seqid
+        accession_id = fastaio.accession_of(seqid, fastaio.genome_ids())
         log(f"Parsed syncoord: accession_id={accession_id}, seqid={seqid}, start={start}, end={end}")
     except ValueError as e:
         log(f"Error parsing syncoord: {syncoord}. Expected format 'accessionID_seqID:start..end'. Error: {e}")
@@ -37,7 +42,7 @@ def extract_sequence(fasta_file, syncoord, reverse_complement=False):
 
     with open(fasta_file, "r") as handle:
         for record in SeqIO.parse(handle, "fasta"):
-            if record.id == f"{accession_id}_{seqid}":
+            if record.id == seqid:
                 seq = record.seq[start-1:end]
                 if reverse_complement:
                     seq = seq.reverse_complement()
@@ -123,8 +128,9 @@ def process_line(args):
     seq1_file = os.path.join(temp_dir, syncoord1.replace(":", "_").replace("..", "_") + ".fa")
     seq2_file = os.path.join(temp_dir, syncoord2.replace(":", "_").replace("..", "_") + ".fa")
 
-    genome1 = os.path.join(genome_dir, syncoord1.split(":")[0].split("_")[0] + "_mod.fa")
-    genome2 = os.path.join(genome_dir, syncoord2.split(":")[0].split("_")[0] + "_mod.fa")
+    _ids = fastaio.genome_ids(genome_dir)
+    genome1 = os.path.join(genome_dir, fastaio.accession_of(syncoord1.split(":")[0], _ids) + "_mod.fa")
+    genome2 = os.path.join(genome_dir, fastaio.accession_of(syncoord2.split(":")[0], _ids) + "_mod.fa")
 
     seq1 = extract_sequence(genome1, syncoord1)
     seq2 = extract_sequence(genome2, syncoord2, reverse_complement=(strand == "-"))
@@ -215,8 +221,8 @@ def main():
     filtered = []
     for line in lines:
         syn1, syn2, _ = line.strip().split("\t")
-        acc1 = syn1.split(":")[0].split("_")[0]
-        acc2 = syn2.split(":")[0].split("_")[0]
+        acc1 = fastaio.accession_of(syn1.split(":")[0], fastaio.genome_ids())
+        acc2 = fastaio.accession_of(syn2.split(":")[0], fastaio.genome_ids())
         if args.pairedIDs and (acc1 in args.pairedIDs and acc2 in args.pairedIDs):
             filtered.append(line)
         elif args.singleID and (acc1 == args.singleID or acc2 == args.singleID):

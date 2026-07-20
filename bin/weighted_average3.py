@@ -3,6 +3,7 @@
 import argparse
 import sys
 from collections import OrderedDict
+import fastaio
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Calculate weighted divergence averages for unique ID pairs at chromosome and genome levels.')
@@ -100,9 +101,10 @@ def write_output(output_file, results):
 
 def extract_genome_id(full_id):
     """
-    Extracts the genome ID by taking the substring before the first underscore.
+    Recover the genome ID, resolving against the canonical list so that IDs
+    containing underscores are not truncated.
     """
-    return full_id.split('_')[0] if '_' in full_id else full_id
+    return fastaio.accession_of(full_id, fastaio.genome_ids())
 
 def process_genome_file(input_file):
     """

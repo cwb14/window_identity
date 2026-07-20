@@ -12,6 +12,7 @@ agree, or the pipeline writes '{id}_mod.fa' under one name and looks for it unde
 another.
 """
 import bz2
+import glob
 import gzip
 import lzma
 import os
@@ -76,6 +77,78 @@ def fasta_stem(path):
     if ext.lower() in FASTA_SUFFIXES:
         name = root
     return name
+
+
+# Cache keyed by resolved work_dir. Pool workers each build their own copy once;
+# the underlying files are small (one line per genome) and never change mid-run.
+_GENOME_ID_CACHE = {}
+
+
+def load_genome_ids(work_dir="."):
+    """
+    Canonical genome IDs for a pipeline working directory, as a frozenset.
+
+    Source precedence, first non-empty wins:
+      1. genome_list.txt   -- one bare ID per line, written by fasta_renamer_diploid.py
+      2. jcvi_list.txt     -- tab-separated pairs; both columns are IDs
+      3. *_mod.fa          -- glob the renamer's own output
+
+    Returns an empty frozenset when none are present, which makes accession_of()
+    fall back to the legacy split('_')[0]. That keeps these scripts usable standalone,
+    outside a pipeline directory.
+    """
+    path = os.path.join(work_dir, "genome_list.txt")
+    if os.path.exists(path):
+        with open(path) as fh:
+            ids = {line.strip() for line in fh if line.strip()}
+        if ids:
+            return frozenset(ids)
+
+    path = os.path.join(work_dir, "jcvi_list.txt")
+    if os.path.exists(path):
+        ids = set()
+        with open(path) as fh:
+            for line in fh:
+                ids.update(line.split())  # whitespace split: IDs may contain dots
+        if ids:
+            return frozenset(ids)
+
+    ids = set()
+    for path in glob.glob(os.path.join(work_dir, "*_mod.fa")):
+        name = os.path.basename(path)
+        ids.add(name[: -len("_mod.fa")])
+    return frozenset(ids)
+
+
+def genome_ids(work_dir="."):
+    """Process-cached load_genome_ids(). Use this from hot paths."""
+    key = os.path.abspath(work_dir)
+    if key not in _GENOME_ID_CACHE:
+        _GENOME_ID_CACHE[key] = load_genome_ids(work_dir)
+    return _GENOME_ID_CACHE[key]
+
+
+def accession_of(seqname, known_ids):
+    """
+    Recover the genome ID from a renamed sequence name.
+
+        accession_of('annuaA_chr_chr1', {'annuaA_chr'}) -> 'annuaA_chr'
+
+    fasta_renamer_diploid.py emits '{id}_chr{N}[LETTERS]' and '{id}_sca{N}', and IDs may
+    themselves contain underscores, so the naive split('_')[0] is wrong. Longest-prefix
+    match against the known IDs is used rather than a suffix regex because a name like
+    'annuaA_chr_chr1' has two valid-looking '_chr' boundaries and only the ID list can
+    say which is real.
+
+    Falls back to the legacy split('_')[0] when known_ids is empty or nothing matches,
+    so underscore-free IDs are unaffected and standalone use still works.
+    """
+    if seqname in known_ids:
+        return seqname
+    for gid in sorted(known_ids, key=len, reverse=True):
+        if seqname.startswith(gid + "_"):
+            return gid
+    return seqname.split("_")[0]
 
 
 def materialize_plain(path, dest_dir=".", log=None):
