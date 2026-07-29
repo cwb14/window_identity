@@ -58,9 +58,23 @@ def parse_syncoord(syncoord, work_dir="."):
     Coordinates are 1-based inclusive, as written by gene_coords_extractor_all4.py.
     The accession is resolved against the canonical genome ID list, so IDs containing
     underscores ('annuaA_chr_chr1') resolve correctly.
+
+    A start of 0 is clamped to 1. The extractor emits one when an anchor sits at the very
+    first base of a sequence -- rare, and in practice only on unplaced scaffolds. Left alone
+    it made extract() call fetch(start - 1) = fetch(-1), which pysam rejects with "start out
+    of range (-1)"; process_line's catch-all then logged the segment and dropped it WITHOUT
+    recording a skip, so it appeared in neither alignment.paf nor alignment_skipped.tsv.
+
+    Clamping has to happen here rather than inside extract(), because build_segment() reads
+    the same values to build Segment, whose t_len/q_len are 'end - start + 1'. Fixing only
+    the fetch would leave the sequence one base shorter than the Segment claims and shift
+    t_off = t_start - 1 to -1, silently moving every emitted coordinate for that segment.
+    With start = 1 the sequence is 'end' bases, t_len is 'end', and t_off is 0 -- all three
+    agree. segment_id() keys off the raw coords string, so resume bookkeeping is unaffected.
     """
     name, rng = syncoord.split(":")
     start, end = (int(x) for x in rng.split(".."))
+    start = max(start, 1)
     accession = fastaio.accession_of(name, fastaio.genome_ids(work_dir))
     return accession, name, start, end
 
