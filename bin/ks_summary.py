@@ -21,6 +21,21 @@ import statistics
 import sys
 
 
+# KaKs_Calculator 3.0 writes its result rows with NO header line, so a merged table has none
+# either: the shell's merge step takes 'head -1' of the first .kaks file as the header, and
+# that line is already data. DictReader would then consume a data row as the header and never
+# find a 'Ks' column. These are the column names the tool itself uses internally, verbatim
+# from KaKs_Calculator-3.0/bin/KaKs.cpp:21-25, and are applied when no header is present.
+KAKS_COLUMNS = [
+    "Sequence", "Method", "Ka", "Ks", "Ka/Ks",
+    "P-Value(Fisher)", "Length", "S-Sites", "N-Sites", "Fold-Sites(0:2:4)",
+    "Substitutions", "Syn-Subs", "Nonsyn-Subs",
+    "Fold-Syn-Subs(0:2:4)", "Fold-Nonsyn-Subs(0:2:4)",
+    "Divergence-Distance", "Substitution-Rate-Ratio(rTC:rAG:rTA:rCG:rTG:rCA/rCA)",
+    "GC(1:2:3)", "ML-Score", "AICc", "Akaike-Weight", "Model",
+]
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Summarise per-gene Ks into one median distance per genome pair."
@@ -56,9 +71,21 @@ def read_ks(path, max_ks, verbose):
     order shifts between methods."""
     kept, seen, dropped = [], 0, 0
     with open(path, newline="") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        if reader.fieldnames is None or "Ks" not in reader.fieldnames:
-            sys.exit(f"Error: {path} has no 'Ks' column (found: {reader.fieldnames})")
+        first = fh.readline()
+        if not first.strip():
+            sys.exit(f"Error: {path} is empty.")
+        fh.seek(0)
+        fields = first.rstrip("\n").split("\t")
+        if "Ks" in fields:
+            reader = csv.DictReader(fh, delimiter="\t")
+        elif len(fields) == len(KAKS_COLUMNS):
+            # Headerless KaKs_Calculator 3.0 output -- name the columns ourselves and treat
+            # every line, including the first, as data.
+            reader = csv.DictReader(fh, delimiter="\t", fieldnames=KAKS_COLUMNS)
+        else:
+            sys.exit(f"Error: {path} has no 'Ks' column and its {len(fields)} columns do not "
+                     f"match the {len(KAKS_COLUMNS)}-column KaKs_Calculator layout. "
+                     f"First fields: {fields[:5]}")
         for row in reader:
             seen += 1
             try:
