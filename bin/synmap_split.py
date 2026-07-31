@@ -161,6 +161,28 @@ def build_segment(syncoord1, syncoord2, q_revcomp, strand):
     )
 
 
+def halve_syncoords(syncoord1, syncoord2, strand):
+    """Split a coords pair at the target midpoint, proportionally on the query.
+
+    Returns [(t_lo, q_lo), (t_hi, q_hi)] as coords strings, or None when the pair
+    is already too small to split. On '-' the query runs backwards against the
+    target, so the target's first half pairs with the query's *second* half.
+    """
+    _, n1, s1, e1 = parse_syncoord(syncoord1)
+    _, n2, s2, e2 = parse_syncoord(syncoord2)
+    t_len, q_len = e1 - s1 + 1, e2 - s2 + 1
+    if t_len < 4 or q_len < 4:
+        return None
+    t_mid = s1 + t_len // 2
+    q_off = max(1, min(q_len - 1, (q_len * (t_len // 2)) // t_len))
+    q_mid = s2 + q_off
+    if strand == "-":
+        return [(f"{n1}:{s1}..{t_mid}", f"{n2}:{q_mid + 1}..{e2}"),
+                (f"{n1}:{t_mid + 1}..{e1}", f"{n2}:{s2}..{q_mid}")]
+    return [(f"{n1}:{s1}..{t_mid}", f"{n2}:{s2}..{q_mid}"),
+            (f"{n1}:{t_mid + 1}..{e1}", f"{n2}:{q_mid + 1}..{e2}")]
+
+
 def length_ratio(seg):
     lo, hi = sorted((seg.t_len, seg.q_len))
     return float("inf") if lo <= 0 else hi / lo
@@ -419,12 +441,14 @@ def _read_skip_rows(path):
 
 def process_line(args):
     line, genome_dir, opts, counter, skipped = args
-    try:
-        syncoord1, syncoord2, strand = line.strip().split("\t")
-    except ValueError:
+    # Column 4, when present, is the syntenic block id. It is consumed by the
+    # consolidator upstream; nothing here needs it, but the unpack must tolerate it.
+    parts = line.strip().split("\t")
+    if len(parts) < 3:
         warn(f"malformed coords line, skipping: {line.strip()!r}")
         counter.value += 1
         return
+    syncoord1, syncoord2, strand = parts[0], parts[1], parts[2]
 
     try:
         seg_probe = build_segment(syncoord1, syncoord2, False, strand)
@@ -439,48 +463,74 @@ def process_line(args):
             return
         ratio = length_ratio(seg_probe)
         if opts["max_len_ratio"] > 0 and ratio > opts["max_len_ratio"]:
-            record_skip(skipped, syncoord1, syncoord2, strand, "length_ratio", f"{ratio:.1f}",
-                        seg_probe.t_len, seg_probe.q_len)
-            counter.value += 1
-            return
+            # No longer a skip. A lopsided span is a reason to subdivide, not to
+            # discard: the aligner seeds it, keeps whatever is genuinely homologous
+            # and tiles the rest. Skipping here threw away 554 Mb of reference span
+            # on this dataset, of which AnchorWave aligned a large share -- so the
+            # sequence was alignable and the guard, not the biology, lost it.
+            warn(f"lopsided span (ratio {ratio:.1f}) at {syncoord1} x {syncoord2}; "
+                 f"subdividing rather than skipping")
 
-        tseq = extract(genome_dir, syncoord1)
+        # Work list rather than a single attempt: a timeout halves the segment and
+        # re-queues the pieces instead of discarding it. Nothing is abandoned for a
+        # resource reason -- only genuinely unalignable sequence ends up recorded,
+        # and it is recorded at the finest granularity we reached, not as one big
+        # "this whole block failed".
+        max_depth = opts.get("max_subdivide_depth", aligners.DEFAULT_MAX_SUBDIVIDE_DEPTH)
+        work = [(syncoord1, syncoord2, 0)]
+        out_lines = []
+        while work:
+            s1, s2, depth = work.pop()
+            probe = build_segment(s1, s2, False, strand)
+            if probe.t_len <= 0 or probe.q_len <= 0:
+                continue
+            tseq = extract(genome_dir, s1)
 
-        if opts["aligner"] == "minimap2":
-            # Preserve historical behaviour exactly: trust the strand column, and let
-            # minimap2's own both-strand search cover it being wrong.
-            q_revcomp = (strand == "-")
-        else:
-            # Strand-sensitive backend: settle orientation from sequence.
-            q_fwd = extract(genome_dir, syncoord2, do_revcomp=False)
-            needs_rc = orientation(tseq, q_fwd, opts["minimap2_bin"], opts["preset"])
-            if needs_rc is None:
-                record_skip(skipped, syncoord1, syncoord2, strand, "no_orientation",
-                            f"{ratio:.1f}", seg_probe.t_len, seg_probe.q_len)
-                counter.value += 1
-                return
-            q_revcomp = needs_rc
+            if opts["aligner"] == "minimap2":
+                # Trust the strand column and let minimap2's own both-strand search
+                # cover it being wrong.
+                q_revcomp = (strand == "-")
+            else:
+                q_fwd = extract(genome_dir, s2, do_revcomp=False)
+                needs_rc = orientation(tseq, q_fwd, opts["minimap2_bin"], opts["preset"],
+                                       timeout=opts.get("orient_timer"))
+                if needs_rc is None:
+                    # Undecidable orientation is not a reason to drop the sequence.
+                    # Fall back to the strand the anchors already voted for; the
+                    # aligner settles it either way.
+                    warn(f"orientation undecidable at {s1} x {s2}; using the "
+                         f"anchor strand '{strand}'")
+                    needs_rc = (strand == "-")
+                q_revcomp = needs_rc
 
-        seg = build_segment(syncoord1, syncoord2, q_revcomp, strand)
-        qseq = extract(genome_dir, syncoord2, do_revcomp=q_revcomp)
+            seg = build_segment(s1, s2, q_revcomp, strand)
+            qseq = extract(genome_dir, s2, do_revcomp=q_revcomp)
 
-        try:
-            lines = BACKENDS[opts["aligner"]](tseq, qseq, seg, opts)
-        except subprocess.TimeoutExpired:
-            record_skip(skipped, syncoord1, syncoord2, strand, "timeout", f"{ratio:.1f}",
-                        seg_probe.t_len, seg_probe.q_len)
-            counter.value += 1
-            return
+            try:
+                lines = BACKENDS[opts["aligner"]](tseq, qseq, seg, opts)
+            except subprocess.TimeoutExpired:
+                halves = halve_syncoords(s1, s2, strand)
+                if depth < max_depth and halves:
+                    warn(f"timeout at {s1} x {s2}; halving and retrying "
+                         f"(depth {depth + 1})")
+                    work.extend((a, b, depth + 1) for a, b in halves)
+                else:
+                    record_skip(skipped, s1, s2, strand, "timeout",
+                                f"{length_ratio(probe):.1f}", probe.t_len, probe.q_len)
+                continue
 
-        if lines:
+            if lines:
+                out_lines.extend(lines)
+            elif depth < max_depth and (halves := halve_syncoords(s1, s2, strand)):
+                # Produced nothing as a whole; it may still align in pieces.
+                work.extend((a, b, depth + 1) for a, b in halves)
+            else:
+                record_skip(skipped, s1, s2, strand, "no_alignment",
+                            f"{length_ratio(probe):.1f}", probe.t_len, probe.q_len)
+
+        if out_lines:
             with open(opts["output_file"], "a") as fh:
-                fh.write("\n".join(lines) + "\n")
-        else:
-            # The aligner ran and produced nothing (empty stdout or non-zero rc, see
-            # align_minimap2). Recording it is what makes "attempted, produced nothing"
-            # distinguishable from "never attempted" -- otherwise resume retries it forever.
-            record_skip(skipped, syncoord1, syncoord2, strand, "no_alignment",
-                        f"{ratio:.1f}", seg_probe.t_len, seg_probe.q_len)
+                fh.write("\n".join(out_lines) + "\n")
     except Exception as exc:  # noqa: BLE001 - one bad segment must not kill the pool
         warn(f"error on {line.strip()!r}: {exc}")
     finally:
@@ -500,6 +550,17 @@ def main():
     p.add_argument("-p", "--processes", type=int, default=10, help="Parallel processes.")
     p.add_argument("-c", "--coords", required=True, help="Syntenic coordinates file.")
     p.add_argument("--timer", type=str, help="Per-alignment timeout, e.g. 10m.")
+    p.add_argument("--seed-timer", type=str, default=None,
+                   help="Optional cap on the minimap2 landmark pass. UNBOUNDED by default: "
+                        "without landmarks the only fallback is a proportional midpoint, "
+                        "which mis-pairs halves across a large indel. Set this only if "
+                        "you deliberately want to bound it.")
+    p.add_argument("--max-align-area", type=int, default=aligners.DEFAULT_MAX_ALIGN_AREA,
+                   help="Attempt a pair directly when t_len*q_len is at or under this; "
+                        "larger pairs are seeded and subdivided first (default: %(default)s).")
+    p.add_argument("--max-subdivide-depth", type=int,
+                   default=aligners.DEFAULT_MAX_SUBDIVIDE_DEPTH,
+                   help="Maximum subdivision recursion depth (default: %(default)s).")
     p.add_argument("--preset", choices=["asm5", "asm10", "asm20"], default="asm10",
                    help="minimap2 preset (default: asm10).")
     p.add_argument("--aligner", choices=sorted(BACKENDS), default="minimap2",
@@ -561,11 +622,28 @@ def main():
             p.error(f"invalid time unit in '{args.timer}'; use d/h/m/s")
         timer = int(args.timer[:-1]) * units[args.timer[-1]]
 
+    # The seed pass must finish well inside the alignment budget, or a segment that
+    # needs subdividing gets no seeds and falls back to blind halving -- which
+    # mis-pairs the halves across a large indel. Measured on the first production
+    # run: a 60 s floor left ~200 pairs per run (mean 11 Mb x 11 Mb, max 53 Mb x
+    # 53 Mb) with a timed-out seed, because 112 processes share 128 cores and a
+    # minimap2 pass at that size needs minutes, not seconds. Floor is now 300 s.
+    # Orientation is a separate, bounded call: it has a safe fallback (the anchor
+    # strand, which the chain step corrects anyway), so capping it costs nothing and
+    # removes the only unbounded-hang path left in a pool worker.
+    orient_timer = 300
+    if args.seed_timer:
+        if args.seed_timer[-1] not in units:
+            p.error(f"invalid time unit in '{args.seed_timer}'; use d/h/m/s")
+        seed_timer = int(args.seed_timer[:-1]) * units[args.seed_timer[-1]]
+    else:
+        seed_timer = None
+
     with open(args.coords) as fh:
         lines = [l for l in fh if l.strip()]
     filtered = []
     for line in lines:
-        syn1, syn2, _ = line.strip().split("\t")
+        syn1, syn2 = line.strip().split("\t")[:2]
         acc1 = fastaio.accession_of(syn1.split(":")[0], fastaio.genome_ids(args.genome_dir))
         acc2 = fastaio.accession_of(syn2.split(":")[0], fastaio.genome_ids(args.genome_dir))
         if args.pairedIDs:
@@ -674,6 +752,8 @@ def main():
         "timer": timer, "debug": args.debug, "temp_base": temp_base,
         "output_file": args.output, "minimap2_bin": args.minimap2_bin,
         "max_len_ratio": args.max_len_ratio,
+        "seed_timer": seed_timer, "orient_timer": orient_timer, "max_align_area": args.max_align_area,
+        "max_subdivide_depth": args.max_subdivide_depth,
         "wfa_bin": args.wfa_bin, "wfa_model": args.wfa_model, "wfa_span": args.wfa_span,
         "wfa_memory": args.wfa_memory, "wfa_heuristic": args.wfa_heuristic,
         "wfa_mismatch": args.wfa_mismatch, "wfa_gap_open1": args.wfa_gap_open1,
