@@ -84,39 +84,63 @@ def read_gene_ids_file(gene_ids_filename):
     return clusters
 
 def process_clusters(clusters, gene_coords):
+    """Block partitioning: one interval per syntenic block, first gene to last.
+
+    This is what `-partition block` means -- cut the block once, end to end. The
+    per-gene-pair cut is `-partition genepair`, in the _pairs module. Emitting
+    gene-pair intervals from here (as this function used to) made the two modes
+    produce byte-identical output, leaving anchor_coord_consolidator as the only
+    thing separating them -- and that consolidator merges on a chromosome/strand
+    key with no block boundary, so it ran away across whole arms.
+
+    The fourth output column is a block id. Downstream it keys the consolidator's
+    merge bins, so merging can never cross a block boundary.
+    """
     output_strings = []
     n_straddle = 0
-    for cluster in clusters:
-        for i in range(len(cluster) - 1):
-            g1a, g1b = cluster[i][0], cluster[i][1]
-            g2a, g2b = cluster[i + 1][0], cluster[i + 1][1]
+    for block_id, cluster in enumerate(clusters, start=1):
+        if not cluster:
+            continue
+        # First and last anchor pair define the block span. For a one-anchor
+        # block these are the same pair, which yields that gene's own extent --
+        # small, but never dropped.
+        g1a, g1b = cluster[0][0], cluster[0][1]
+        g2a, g2b = cluster[-1][0], cluster[-1][1]
 
-            missing = [g for g in (g1a, g1b, g2a, g2b) if g not in gene_coords]
-            if missing:
-                print(f"WARNING: missing {len(missing)} gene(s) in BED: {', '.join(missing)}", file=sys.stderr)
-                continue
+        missing = [g for g in (g1a, g1b, g2a, g2b) if g not in gene_coords]
+        if missing:
+            print(f"WARNING: missing {len(missing)} gene(s) in BED: {', '.join(missing)}", file=sys.stderr)
+            continue
 
-            coords_1 = gene_coords[g1a]
-            coords_2 = gene_coords[g1b]
-            coords_3 = gene_coords[g2a]
-            coords_4 = gene_coords[g2b]
+        coords_1 = gene_coords[g1a]
+        coords_2 = gene_coords[g1b]
+        coords_3 = gene_coords[g2a]
+        coords_4 = gene_coords[g2b]
 
-            strand = directionality(coords_1, coords_2, coords_3, coords_4)
-            if strand is None:
-                # Anchors disagree: the span crosses an inversion boundary, so no single
-                # orientation is right. Take the first anchor's call and let the aligner's
-                # sequence-level orientation check settle it.
-                strand = "+" if coords_1[3] == coords_2[3] else "-"
-                n_straddle += 1
+        # A block whose ends sit on different sequences is not a block; spanning
+        # it would invent an interval covering everything between them.
+        if coords_1[0] != coords_3[0] or coords_2[0] != coords_4[0]:
+            print(f"WARNING: block {block_id} spans multiple sequences "
+                  f"({coords_1[0]}/{coords_3[0]}, {coords_2[0]}/{coords_4[0]}); skipping",
+                  file=sys.stderr)
+            continue
 
-            left_span = f"{coords_1[0]}:{min(coords_1[1], coords_3[1])}..{max(coords_1[2], coords_3[2])}"
-            right_span = f"{coords_2[0]}:{min(coords_2[1], coords_4[1])}..{max(coords_2[2], coords_4[2])}"
+        strand = directionality(coords_1, coords_2, coords_3, coords_4)
+        if strand is None:
+            # Anchors disagree: the span crosses an inversion boundary, so no single
+            # orientation is right. Take the first anchor's call and let the aligner's
+            # sequence-level orientation check settle it.
+            strand = "+" if coords_1[3] == coords_2[3] else "-"
+            n_straddle += 1
 
-            output_strings.append(f"{left_span}\t{right_span}\t{strand}")
+        left_span = f"{coords_1[0]}:{min(coords_1[1], coords_3[1])}..{max(coords_1[2], coords_3[2])}"
+        right_span = f"{coords_2[0]}:{min(coords_2[1], coords_4[1])}..{max(coords_2[2], coords_4[2])}"
+
+        output_strings.append(f"{left_span}\t{right_span}\t{strand}\t{block_id}")
     if n_straddle:
         print(f"NOTE: {n_straddle} of {len(output_strings)} spans straddle an inversion "
-              f"boundary (the two anchors disagree on orientation); used the first anchor's "
-              f"call", file=sys.stderr)
+              f"boundary (the block's first and last anchor disagree on orientation); "
+              f"used the first anchor's call", file=sys.stderr)
     return output_strings
 
 def parse_species_from_mcscan(mcscan_filename):
