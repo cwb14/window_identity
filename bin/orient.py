@@ -39,12 +39,18 @@ def revcomp(s: str) -> str:
 
 
 def orientation(seq1: str, seq2: str, minimap2_bin: str = "minimap2",
-                preset: str = "asm20", threads: int = 1) -> Optional[bool]:
+                preset: str = "asm20", threads: int = 1,
+                timeout: Optional[float] = None) -> Optional[bool]:
     """True if seq2 must be reverse-complemented to align with seq1.
 
-    Returns None when minimap2 finds no alignment -- the segment is not confidently
-    homologous (often a consolidator-stitched synthetic span) and should be skipped
-    rather than aligned on a guess.
+    Returns None when minimap2 finds no alignment, errors, or exceeds `timeout`.
+    The caller treats None as "undecidable" and falls back to the anchor strand,
+    which the chain step then corrects anyway (each chain carries its own strand),
+    so a None costs nothing but a guess at the submission frame.
+
+    The timeout is not optional in practice. This call sits outside the
+    subdivide-and-retry logic, so without one a single pathological pair hangs a
+    pool worker forever and the run just appears to stall.
     """
     d = tempfile.mkdtemp(prefix="orient_")
     try:
@@ -54,11 +60,14 @@ def orientation(seq1: str, seq2: str, minimap2_bin: str = "minimap2",
             fh.write(f">t\n{seq1}\n")
         with open(q_fa, "w") as fh:
             fh.write(f">q\n{seq2}\n")
-        proc = subprocess.run(
-            [minimap2_bin, "-t", str(threads), "--secondary=no", "-x", preset,
-             t_fa, q_fa],
-            capture_output=True, text=True,
-        )
+        try:
+            proc = subprocess.run(
+                [minimap2_bin, "-t", str(threads), "--secondary=no", "-x", preset,
+                 t_fa, q_fa],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
         if proc.returncode != 0:
             return None
         best = None
