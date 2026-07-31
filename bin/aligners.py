@@ -164,12 +164,21 @@ def align_wfa(tseq, qseq, seg, opts) -> List[AlnRecord]:
     if not opts.get("wfa_chain", True):
         return align_wfa_global(tseq, qseq, seg, opts)
 
-    anchors = _minimap2_anchors(tseq, qseq, opts)
+    # seeding=True: this is inter-anchoring too, so it must not be bounded by the
+    # alignment timer. Without it, a large segment's top-level anchor pass could be
+    # killed at --timer and drop through to align_colinear with no chains -- which
+    # is the blind-halving path. Observed once on a 35.9 Mb x 37.0 Mb block-mode
+    # segment, where a 600 s cap was nowhere near enough.
+    anchors = _minimap2_anchors(tseq, qseq, opts, seeding=True)
     chains = chain.colinear_chains(anchors, min_chain_len=opts.get("min_chain_len", 500),
                                    t_len=len(tseq), q_len=len(qseq))
     if not chains:
-        # No usable anchors: fall back to a single global path rather than emitting nothing.
-        return align_wfa_global(tseq, qseq, seg, opts)
+        # No usable anchors at this level. Subdivide rather than betting the whole
+        # segment on one global path that will time out if it is large.
+        return [AlnRecord(q_start=sq, q_end=sq + consumed(ops)[1],
+                          t_start=st, t_end=st + consumed(ops)[0],
+                          strand="+", ops=ops)
+                for st, sq, ops in align_colinear(tseq, qseq, opts)]
 
     out = []
     for c in chains:
@@ -177,21 +186,23 @@ def align_wfa(tseq, qseq, seg, opts) -> List[AlnRecord]:
         q_sub = qseq[c.q_start:c.q_end]
         if c.strand == "-":
             q_sub = _revcomp(q_sub)
-        ops = _wfa_one(t_sub, q_sub, opts)
-        if not ops:
-            continue
-        t_used, q_used = consumed(ops)
-        if c.strand == "-":
-            # ops were computed against the revcomped chain; the query interval is still
-            # [c.q_start, c.q_end) in the forward frame, and paf_emit maps it from there.
-            q_lo = c.q_end - q_used
-            q_hi = c.q_end
-        else:
-            q_lo = c.q_start
-            q_hi = c.q_start + q_used
-        out.append(AlnRecord(q_start=q_lo, q_end=q_hi,
-                             t_start=c.t_start, t_end=c.t_start + t_used,
-                             strand=c.strand, ops=ops))
+        # A chain that will not align in one piece gets subdivided, not dropped.
+        # `continue` here was a silent coverage loss: the hardest chains -- the ones
+        # carrying the large indels -- are exactly the ones that failed.
+        for st, sq, ops in align_colinear(t_sub, q_sub, opts):
+            t_used, q_used = consumed(ops)
+            if c.strand == "-":
+                # ops are in the revcomped chain frame; mirror back into the forward
+                # frame, where paf_emit.map_to_parent expects them.
+                q_lo = c.q_end - (sq + q_used)
+                q_hi = c.q_end - sq
+            else:
+                q_lo = c.q_start + sq
+                q_hi = c.q_start + sq + q_used
+            out.append(AlnRecord(q_start=q_lo, q_end=q_hi,
+                                 t_start=c.t_start + st,
+                                 t_end=c.t_start + st + t_used,
+                                 strand=c.strand, ops=ops))
     return out
 
 
@@ -202,7 +213,205 @@ def _revcomp(s):
 _COMP = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
 
 
-def _minimap2_anchors(tseq, qseq, opts):
+# Subdivision defaults. A pair is attempted directly when t_len * q_len is at or
+# under MAX_ALIGN_AREA; larger pairs are seeded and split first. Area rather than
+# length is the right gate because WFA cost scales with the product, which is also
+# how AnchorWave gates its own novel-anchor pass (`-fa3`, on len_r*len_q > T**2).
+DEFAULT_MAX_ALIGN_AREA = 100_000 ** 2
+DEFAULT_MAX_SUBDIVIDE_DEPTH = 8
+MIN_SUBDIVIDE_LEN = 200  # below this, just align it; seeding cannot help
+
+
+def _tile_from_chains(chains, t_len, q_len):
+    """Ordered sub-intervals that TILE the pair: each chain, plus the gaps around them.
+
+    Returns [(t0, t1, q0, q1), ...] covering [0,t_len) x [0,q_len) with no holes, so
+    subdividing can never drop sequence -- the gaps between seeds are exactly the hard
+    regions, and they must be recursed into, not discarded.
+    """
+    tiles = []
+    t_at = q_at = 0
+    for c in sorted(chains, key=lambda c: (c.t_start, c.q_start)):
+        if c.t_start < t_at or c.q_start < q_at:
+            continue  # overlaps what we already covered; skip rather than double-count
+        if c.t_start > t_at or c.q_start > q_at:
+            tiles.append((t_at, c.t_start, q_at, c.q_start))
+        tiles.append((c.t_start, c.t_end, c.q_start, c.q_end))
+        t_at, q_at = c.t_end, c.q_end
+    if t_at < t_len or q_at < q_len:
+        tiles.append((t_at, t_len, q_at, q_len))
+    return [t for t in tiles if t[1] > t[0] or t[3] > t[2]]
+
+
+def align_colinear(tseq, qseq, opts, depth=0):
+    """Align an oriented, colinear pair, subdividing rather than giving up.
+
+    Returns [(t_start, q_start, ops), ...] in the local frame of (tseq, qseq).
+
+    A timeout or a WFA failure is a signal to re-seed and split, never a reason to
+    emit nothing. That is the one behaviour that separated this pipeline from
+    AnchorWave: AnchorWave densifies anchors inside a block until every remaining
+    interval is small enough to align, and only the interval sizes ever shrink, so
+    it always terminates with a full alignment. Measured on this data, one minimap2
+    seed pass over a whole chromosome leaves gaps with a median of ~2.5 kb.
+
+    Recursion stops on depth, on a pair too small to seed, or when seeding fails to
+    make the interval strictly smaller (no progress).
+    """
+    if not tseq or not qseq:
+        return []
+
+    max_area = opts.get("max_align_area", DEFAULT_MAX_ALIGN_AREA)
+    at_floor = (depth >= opts.get("max_subdivide_depth", DEFAULT_MAX_SUBDIVIDE_DEPTH)
+                or len(tseq) < MIN_SUBDIVIDE_LEN or len(qseq) < MIN_SUBDIVIDE_LEN)
+
+    # Attempt directly when the pair is small enough to be worth it -- or when it
+    # cannot be split any further, in which case the area budget is irrelevant:
+    # refusing to try is just dropping the sequence. That was a real defect; a
+    # piece below the split floor got no alignment attempt at all.
+    if len(tseq) * len(qseq) <= max_area or at_floor:
+        try:
+            ops = _wfa_one(tseq, qseq, opts)
+        except subprocess.TimeoutExpired:
+            ops = None
+        if ops:
+            return [(0, 0, ops)]
+
+    if at_floor:
+        return []
+
+    anchors = _minimap2_anchors(tseq, qseq, opts, seeding=True)
+    chains = [c for c in chain.colinear_chains(
+        anchors, min_chain_len=opts.get("min_chain_len", 500),
+        t_len=len(tseq), q_len=len(qseq)) if c.strand == "+"]
+    tiles = _tile_from_chains(chains, len(tseq), len(qseq)) if chains else []
+
+    # Seeding can fail to make progress two ways: no usable chain at all, or a
+    # single chain spanning the whole pair (the common case -- the pair really is
+    # colinear, just too big to align in one go). Returning [] here would be the
+    # give-up this function exists to remove, so fall back to halving.
+    #
+    # AnchorWave's equivalent is its SLIDING_WINDOW branch, which cuts at the
+    # argmax of a score-only DP extension. A proportional midpoint is cruder, but
+    # it guarantees both halves are strictly smaller, so recursion terminates, and
+    # each half is re-seeded on the way down -- which usually finds the anchors the
+    # whole-span pass could not resolve.
+    if not tiles or (len(tiles) == 1 and tiles[0] == (0, len(tseq), 0, len(qseq))):
+        # Cut at the seed alignment's own large indels first. A blind midpoint
+        # mis-pairs the halves whenever a big indel sits between them: on a
+        # 20 kb x 23 kb pair carrying one 3 kb insertion it tiled the reference
+        # fully but matched only 4,909 of 20,000 bases, because every piece below
+        # the first cut was offset by the insertion and WFA end2end dutifully
+        # aligned the wrong sequences to each other. The CIGAR knows exactly where
+        # the query jumps, so cutting there keeps both sides in register.
+        pts = _seed_breakpoints(tseq, qseq, opts)
+        if pts:
+            tiles = []
+            t_at = q_at = 0
+            for t_cut, q_cut in pts:
+                if t_cut > t_at or q_cut > q_at:
+                    tiles.append((t_at, t_cut, q_at, q_cut))
+                    t_at, q_at = t_cut, q_cut
+            if t_at < len(tseq) or q_at < len(qseq):
+                tiles.append((t_at, len(tseq), q_at, len(qseq)))
+        if not tiles or (len(tiles) == 1
+                         and tiles[0] == (0, len(tseq), 0, len(qseq))):
+            t_mid = len(tseq) // 2
+            q_mid = max(1, min(len(qseq) - 1,
+                               len(qseq) * t_mid // max(1, len(tseq))))
+            tiles = [(0, t_mid, 0, q_mid), (t_mid, len(tseq), q_mid, len(qseq))]
+
+    out = []
+    for t0, t1, q0, q1 in tiles:
+        for st, sq, ops in align_colinear(tseq[t0:t1], qseq[q0:q1], opts, depth + 1):
+            out.append((t0 + st, q0 + sq, ops))
+    return out
+
+
+_CIGAR_OP = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def _seed_breakpoints(tseq, qseq, opts, min_indel=100):
+    """(t_pos, q_pos) cut points at the large indels of the best seed alignment.
+
+    Positions are local to (tseq, qseq) and paired, so cutting there leaves both
+    sides in register -- which a proportional midpoint does not once an indel sits
+    between the halves. Only forward-strand records are used; align_colinear is
+    given an already-oriented pair.
+    """
+    paf = _minimap2_paf(tseq, qseq, opts, seeding=True)
+    best = None
+    for line in paf.strip().split("\n"):
+        c = line.split("\t")
+        if len(c) < 12 or c[4] != "+":
+            continue
+        try:
+            score = int(c[9])
+        except ValueError:
+            continue
+        if best is None or score > best[0]:
+            best = (score, c)
+    if best is None:
+        return []
+    c = best[1]
+    cg = next((f[5:] for f in c[12:] if f.startswith("cg:Z:")), None)
+    if not cg:
+        return []
+    t, q = int(c[7]), int(c[2])
+    pts = []
+    for num, op in _CIGAR_OP.findall(cg):
+        n = int(num)
+        if op in ("M", "=", "X"):
+            t += n
+            q += n
+        elif op in ("D", "N"):          # reference advances, query does not
+            if n >= min_indel:
+                pts.append((t, q))
+            t += n
+            if n >= min_indel:
+                pts.append((t, q))
+        elif op == "I":                 # query advances, reference does not
+            if n >= min_indel:
+                pts.append((t, q))
+            q += n
+            if n >= min_indel:
+                pts.append((t, q))
+    return pts
+
+
+def _minimap2_paf(tseq, qseq, opts, seeding=False):
+    """Raw seed PAF for this pair; '' on any failure."""
+    d = tempfile.mkdtemp(dir=opts.get("temp_base") or None, prefix="seed_")
+    try:
+        t_fa, q_fa = os.path.join(d, "t.fa"), os.path.join(d, "q.fa")
+        with open(t_fa, "w") as fh:
+            fh.write(f">t\n{tseq}\n")
+        with open(q_fa, "w") as fh:
+            fh.write(f">q\n{qseq}\n")
+        # The landmark pass is UNBOUNDED by default. It is the thing that makes
+        # subdivision safe: without landmarks the only fallback is a proportional
+        # midpoint, which mis-pairs the halves across a large indel and lets an
+        # end2end aligner confidently align the wrong sequences together. A 60 s
+        # budget silently pushed ~200 of the largest pairs per run down that path.
+        # Letting minimap2 take the minutes it needs is always cheaper than the
+        # alignment it protects. --seed-timer can still impose one deliberately.
+        budget = opts.get("seed_timer") if seeding else opts.get("timer")
+        try:
+            res = subprocess.run(
+                [opts.get("minimap2_bin", "minimap2"), "-t", str(opts.get("threads", 1)),
+                 "--secondary=no", "-x", opts.get("preset", "asm20"), "-c", t_fa, q_fa],
+                capture_output=True, text=True, timeout=budget)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"[seed] minimap2 pass failed on a {len(tseq)}x{len(qseq)}bp "
+                  f"pair: {type(exc).__name__} -- falling back to proportional "
+                  f"halving, which is NOT indel-aware", file=sys.stderr)
+            return ""
+        return res.stdout if res.returncode == 0 else ""
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _minimap2_anchors(tseq, qseq, opts, seeding=False):
     """Anchor pass. tseq/qseq are as submitted, so anchors are window-local.
 
     `-c` is required, not an optimisation. Without base-level alignment minimap2 reports the
@@ -221,10 +430,20 @@ def _minimap2_anchors(tseq, qseq, opts):
             fh.write(f">t\n{tseq}\n")
         with open(q_fa, "w") as fh:
             fh.write(f">q\n{qseq}\n")
-        res = subprocess.run(
-            [opts.get("minimap2_bin", "minimap2"), "-t", str(opts.get("threads", 1)),
-             "--secondary=no", "-x", opts.get("preset", "asm20"), "-c", t_fa, q_fa],
-            capture_output=True, text=True, timeout=opts.get("timer"))
+        # The seed pass gets its own, shorter budget. Sharing opts['timer'] with the
+        # alignment meant the seeder could be killed by the very timeout it exists to
+        # prevent -- and a dead seeder turns into a skipped segment.
+        budget = opts.get("seed_timer") if seeding else opts.get("timer")
+        try:
+            res = subprocess.run(
+                [opts.get("minimap2_bin", "minimap2"), "-t", str(opts.get("threads", 1)),
+                 "--secondary=no", "-x", opts.get("preset", "asm20"), "-c", t_fa, q_fa],
+                capture_output=True, text=True, timeout=budget)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # Returning [] lets the caller fall back; raising would abort the segment.
+            print(f"[seed] minimap2 anchor pass failed on a {len(tseq)}x{len(qseq)}bp "
+                  f"pair: {type(exc).__name__}", file=sys.stderr)
+            return []
         if res.returncode != 0:
             return []
         return chain.parse_paf_anchors(res.stdout, min_len=opts.get("min_anchor_len", 200))
