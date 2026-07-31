@@ -27,6 +27,9 @@ TESORTER="yes"
 CSCORE=0.99
 # Synteny block consolidation (see Steps 6-9). Defaults match synLTR/module1.py.
 MIN_BLOCK_SIZE=15000
+# Step 11b, chaining PAF records into blocks for reporting.
+CHAIN_MAX_GAP=20000000
+CHAIN_GAP_FACTOR=1.0
 STITCH_GAPS="yes"
 # Step 10 alignment. ALIGNER=minimap2 is the historical default and is unchanged.
 ALIGNER="minimap2"
@@ -40,7 +43,12 @@ RESUME="yes"
 # block    = span each syntenic block end to end (historical).
 # genepair = span adjacent gene pairs within a block; skips the consolidator, whose 15kb
 #            merge and gap-stitching would undo the finer granularity.
-PARTITION="block"
+# genepair is the default: it tiles the genome once with small, evenly sized
+# segments, and it discarded ~100x less sequence than block did in benchmarking.
+# block is still supported and now genuinely cuts each syntenic block once, end to
+# end -- useful when you want block-scale records, but its segments reach 52 Mb on
+# this data, so it leans much harder on subdivision.
+PARTITION="genepair"
 # Segments more length-skewed than this are skipped and logged; 0 disables. Borrowed from
 # riparian.py's --max-len-ratio default (its rescue logic is deliberately NOT borrowed --
 # it exists to keep skewed blocks for plot completeness, the opposite of what we want).
@@ -773,15 +781,20 @@ while read -r line; do
         echo "Polishing $polished_file (pass 2 -> $polished2_file)"
         python "$BIN_DIR/anchor_coord_subtracter.py" "$polished_file" "$polished2_file"
 
-        if [[ "$PARTITION" == "genepair" ]]; then
-            # The consolidator merges to >=MIN_BLOCK_SIZE and stitches gaps, which would
-            # rebuild the very blocks gene-pair partitioning exists to avoid.
-            echo "Partition=genepair: skipping the consolidator, using $polished2_file as-is"
-            cp "$polished2_file" "$coords_file"
-        else
-            echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS)"
-            python "$BIN_DIR/anchor_coord_consolidator.py" "${CONSOLIDATOR_OPTS[@]}" "$polished2_file" >"$coords_file"
-        fi
+        # The consolidator runs in BOTH modes. It only normalises segment size --
+        # grouping intervals up to MIN_BLOCK_SIZE so we never submit a job too small
+        # to be worth a process -- and it is not what distinguishes the partition
+        # modes. That distinction lives in the extractors chosen at Step 7:
+        # ..._all4.py cuts each block once end to end, ..._all4_pairs.py cuts between
+        # consecutive anchor genes.
+        #
+        # It used to be the mode selector, which meant genepair never got size
+        # normalisation and block got an unbounded merge: consecutive gene-pair
+        # intervals share an anchor gene so they always touch, and the merge was
+        # transitive across a whole (chrom, chrom, strand) bin. Both the merge and
+        # the gap stitching are now scoped by the block id in column 4.
+        echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS)"
+        python "$BIN_DIR/anchor_coord_consolidator.py" "${CONSOLIDATOR_OPTS[@]}" "$polished2_file" >"$coords_file"
     else
         echo "Coords file $coords_file exists. Skipping."
     fi
@@ -847,6 +860,24 @@ if need_run "alignment_adjust.paf"; then
     # The four added columns on the rightmost end are (query_genome_length, target_genome_length, number_matches_and_mismatches, and k2p).
 else
     echo "alignment_adjust.paf exists. Skipping."
+fi
+
+# Step 11b - Chain collinear PAF records into blocks.
+#
+# Read-only: it does not touch alignment_adjust.paf, it reports how those records
+# line up. The aligner emits one record per alignment, so a collinear chromosome
+# arm arrives as tens of thousands of fragments; AnchorWave reports the same
+# sequence as a handful of blocks purely because its chaining charges nothing for
+# a large gap. --max-gap-factor is what keeps this honest: a chain may only jump a
+# gap proportional to what it has already aligned, so a long block has to be
+# supported by dense alignment rather than by two distant fragments.
+if need_run "alignment_blocks.tsv"; then
+    echo "Chaining collinear PAF records into blocks -> alignment_blocks.tsv"
+    python "$BIN_DIR/paf_chain_blocks.py" alignment_adjust.paf \
+        --max-gap "$CHAIN_MAX_GAP" --max-gap-factor "$CHAIN_GAP_FACTOR" \
+        -o alignment_blocks.tsv --verbose
+else
+    echo "alignment_blocks.tsv exists. Skipping."
 fi
 
 if need_run "alignment_adjust.tsv"; then
