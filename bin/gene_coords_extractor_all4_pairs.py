@@ -75,11 +75,15 @@ def read_gene_pairs(gene_pairs_filename):
 
 
 def process_pairs(blocks, gene_coords):
-    """
-    For each block, span adjacent pairs within that block only.
+    """Gene-pair partitioning: one interval per consecutive anchor pair.
+
+    Contrast gene_coords_extractor_all4.process_clusters, which cuts each block
+    once end to end. The fourth output column is the block id these intervals
+    came from; it keeps anchor_coord_consolidator from merging across a block
+    boundary when it later groups these back up to a workable size.
     """
     output_strings = []
-    for block in blocks:
+    for block_id, block in enumerate(blocks, start=1):
         if len(block) < 2:
             continue
         for i in range(len(block) - 1):
@@ -112,7 +116,8 @@ def process_pairs(blocks, gene_coords):
             coord_str1 = f"{coords1[0]}:{range1_start}..{range1_end}"
             coord_str2 = f"{coords2[0]}:{range2_start}..{range2_end}"
 
-            output_strings.append(f"{coord_str1}\t{coord_str2}\t{directionality}")
+            output_strings.append(
+                f"{coord_str1}\t{coord_str2}\t{directionality}\t{block_id}")
 
     return output_strings
 
