@@ -2,7 +2,8 @@
 import sys
 import argparse
 
-def process_file(infile: str, threshold: int, stitch_gaps: bool):
+def process_file(infile: str, threshold: int, stitch_gaps: bool,
+                 max_stitch_ratio: float = 3.0):
     """
     Process the anchors coordinate file to merge lines based on overlapping
     or touching (butt heads) sequence ranges, per (pair1_id, pair2_id, strand) bin.
@@ -36,13 +37,17 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
             pair1_id, pair1_start, pair1_end = parse_range(parts[0])
             pair2_id, pair2_start, pair2_end = parse_range(parts[1])
             strand = parts[2].strip()
+            # Column 4 is the syntenic block id from the coord extractors. It goes
+            # into the bin key so a merge can never span two blocks. Files written
+            # before this column existed have three columns; they bin as before.
+            block = parts[3].strip() if len(parts) > 3 else ""
 
             # Calculate lengths (half-open style; matches original behavior)
             len1 = pair1_end - pair1_start
             len2 = pair2_end - pair2_start
 
             threshold_status = "pass" if (len1 >= threshold and len2 >= threshold) else "fail"
-            bin_key = f"{pair1_id}_{pair2_id}_{'plus' if strand == '+' else 'minus'}"
+            bin_key = f"{pair1_id}_{pair2_id}_{'plus' if strand == '+' else 'minus'}_{block}"
 
             new_line = [
                 pair1_id, pair1_start, pair1_end,   # 0..2
@@ -50,7 +55,8 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
                 strand,                             # 6
                 len1, len2,                         # 7..8
                 bin_key,                            # 9
-                threshold_status                    # 10
+                threshold_status,                   # 10
+                block                               # 11
             ]
             bins.setdefault(bin_key, []).append(new_line)
 
@@ -74,8 +80,23 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
                 cond1 = ranges_touch_or_overlap(current_line[1], current_line[2], line[1], line[2])
                 cond2 = ranges_touch_or_overlap(current_line[4], current_line[5], line[4], line[5])
 
-                # Merge if both sequences overlap or touch AND at least one record is "fail"
-                if cond1 and cond2 and (current_line[10] == "fail" or line[10] == "fail"):
+                # Merge only while the record being placed is still under the
+                # threshold. The old condition also fired when the *other* record
+                # was "fail", and unconditionally stamped the result "pass" -- so a
+                # record that had already reached the threshold went on absorbing
+                # every small neighbour. Since consecutive gene-pair intervals share
+                # an anchor gene they always touch, and the median interval is far
+                # below the threshold, that merge ran transitively down a whole
+                # chromosome arm (4.12 Gb of segment span over a 1.12 Gb genome,
+                # single segments up to 159 Mb).
+                #
+                # Recomputing the status instead of assuming "pass" lets a merged
+                # record keep growing only until it genuinely reaches the threshold,
+                # which bounds a segment at roughly threshold + one interval. It
+                # terminates because every merge strictly increases both lengths.
+                if cond1 and cond2 and current_line[10] == "fail":
+                    new_len1 = max(current_line[2], line[2]) - min(current_line[1], line[1])
+                    new_len2 = max(current_line[5], line[5]) - min(current_line[4], line[4])
                     merged_line = [
                         current_line[0],
                         min(current_line[1], line[1]),
@@ -84,11 +105,10 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
                         min(current_line[4], line[4]),
                         max(current_line[5], line[5]),
                         current_line[6],
-                        # these len fields aren’t used for output, but keep them coherent
-                        max(current_line[2], line[2]) - min(current_line[1], line[1]),
-                        max(current_line[5], line[5]) - min(current_line[4], line[4]),
+                        new_len1, new_len2,
                         current_line[9],
-                        "pass"  # merged becomes pass
+                        "pass" if (new_len1 >= threshold and new_len2 >= threshold) else "fail",
+                        current_line[11]
                     ]
                     lines[i] = merged_line
                     merged = True
@@ -161,6 +181,17 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
                     # Not consecutive in pair2 order → bogus stitch, skip
                     continue
 
+                # GUARD #3: the two gaps must be of comparable size. A stitch
+                # asserts "these two spans are each other's counterpart"; 50 Mb
+                # against 10 Mb asserts something the anchors never showed. Such a
+                # record is unalignable end-to-end and previously became either a
+                # length_ratio skip or a timeout -- a segment invented here and then
+                # thrown away downstream.
+                g1 = gap1_end - gap1_start
+                g2 = gap2_end - gap2_start
+                if max_stitch_ratio > 0 and max(g1, g2) > max_stitch_ratio * min(g1, g2):
+                    continue
+
                 # If both guards pass, insert the synthetic line
                 stitched.append([
                     prev[0], gap1_start, gap1_end,
@@ -169,7 +200,8 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
                     gap1_end - gap1_start,
                     gap2_end - gap2_start,
                     bin_key,
-                    "stitched"  # internal marker; output format ignores this
+                    "stitched",  # internal marker; output format ignores this
+                    prev[11]     # a stitched gap belongs to the block it sits inside
                 ])
 
             # append the last original record (in pair1 order)
@@ -182,7 +214,11 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool):
     # Flatten bins in insertion order; within bin keep sorted order for determinism
     for bin_key in final_bins:
         for line in sorted(final_bins[bin_key], key=lambda x: (x[1], x[4])):
-            print(f"{line[0]}:{line[1]}..{line[2]}\t{line[3]}:{line[4]}..{line[5]}\t{line[6]}")
+            row = (f"{line[0]}:{line[1]}..{line[2]}\t"
+                   f"{line[3]}:{line[4]}..{line[5]}\t{line[6]}")
+            if line[11]:
+                row += f"\t{line[11]}"
+            print(row)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -203,13 +239,23 @@ def main():
         action="store_true",
         help="After merging, insert synthetic lines to fill positive gaps between consecutive records within each (pair1, pair2, strand) bin."
     )
+    parser.add_argument(
+        "--max-stitch-ratio",
+        type=float,
+        default=3.0,
+        help="Do not stitch a gap pair whose two sides differ by more than this "
+             "factor; 0 disables the check (default: %(default)s). A 50 Mb vs 10 Mb "
+             "stitch asserts a correspondence the anchors never showed, and the "
+             "resulting segment is unalignable end-to-end."
+    )
     args = parser.parse_args()
 
     if args.threshold < 0:
         print("Threshold must be non-negative.", file=sys.stderr)
         sys.exit(2)
 
-    process_file(args.infile, args.threshold, args.stitch_gaps)
+    process_file(args.infile, args.threshold, args.stitch_gaps,
+                 args.max_stitch_ratio)
 
 if __name__ == "__main__":
     main()
