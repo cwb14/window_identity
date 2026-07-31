@@ -40,13 +40,19 @@ def main():
             line = raw.strip()
             if not line:
                 continue
-            ref_str, qry_str, strand = line.split('\t')
+            # Column 4 is an optional block id added by the coord extractors.
+            # Files written before it existed have three columns, so accept both.
+            parts = line.split('\t')
+            if len(parts) < 3:
+                continue
+            ref_str, qry_str, strand = parts[0], parts[1], parts[2]
+            block = parts[3] if len(parts) > 3 else None
             ref_acc, ref_start, ref_end = parse_alignment(ref_str)
             qry_acc, qry_start, qry_end = parse_alignment(qry_str)
             alignments.append({
                 'line': line,
                 'ref_str': ref_str, 'qry_str': qry_str,
-                'strand': strand,
+                'strand': strand, 'block': block,
                 'ref_acc': ref_acc, 'ref_start': ref_start, 'ref_end': ref_end,
                 'qry_acc': qry_acc, 'qry_start': qry_start, 'qry_end': qry_end
             })
@@ -101,6 +107,8 @@ def main():
                     new_ref_str = format_alignment(aj['ref_acc'], new_ref_start, aj['ref_end'])
                     new_qry_str = format_alignment(aj['qry_acc'], new_qry_start, aj['qry_end'])
                     new_line = f"{new_ref_str}\t{new_qry_str}\t{aj['strand']}"
+                    if aj['block'] is not None:
+                        new_line += f"\t{aj['block']}"
                     if verbose:
                         print(
                             f"PARTIAL OVERLAP: {ai['line']} partially overlaps with {old_line}. "
