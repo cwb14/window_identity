@@ -125,3 +125,56 @@ def test_flank_factor_is_tunable_and_zero_disables(tmp_path, capsys):
     assert len(run(tmp_path, capsys, [left, right])) == 2
     assert len(run(tmp_path, capsys, [left, right], stitch_flank_factor=2.0)) == 3
     assert len(run(tmp_path, capsys, [left, right], stitch_flank_factor=0)) == 3
+
+
+# ---------------------------------------------------------------- stitching under genepair
+
+def gene_pairs(block, a0, b0, n=3, step=M, strand="+", ca="A_chr1", cb="B_chr1"):
+    """A block cut into n consecutive gene-pair segments, as -partition genepair emits."""
+    return [rec(a0 + i * step, a0 + (i + 1) * step, b0 + i * step, b0 + (i + 1) * step,
+                strand, block, ca, cb) for i in range(n)]
+
+
+def test_gap_between_blocks_is_stitched_under_genepair(tmp_path, capsys):
+    # Two blocks of 3 Mb each (3 segments apiece) with a 1 Mb gap between them. The segments
+    # bordering the gap are only 1 Mb, but the BLOCKS they belong to are 3 Mb, so the gap is
+    # backed by synteny and must be stitched.
+    lines = gene_pairs(1, 0, 0) + gene_pairs(2, 4 * M, 4 * M)
+    out = spans(run(tmp_path, capsys, lines, threshold=0))
+    assert (3.0, 4.0, 3.0, 4.0, "+") in out
+    assert len(out) == 7
+
+
+def test_genepair_stitch_uses_block_extent_not_segment_length(tmp_path, capsys):
+    # Gap (2 Mb) is longer than the bordering segments (1 Mb) but shorter than the blocks
+    # (3 Mb): allowed. Bumping the gap past the block extent is not.
+    ok = gene_pairs(1, 0, 0) + gene_pairs(2, 5 * M, 5 * M)
+    assert len(spans(run(tmp_path, capsys, ok, threshold=0))) == 7
+    far = gene_pairs(1, 0, 0) + gene_pairs(2, 10 * M, 10 * M)      # 7 Mb gap vs 3 Mb blocks
+    assert len(spans(run(tmp_path, capsys, far, threshold=0))) == 6
+
+
+def test_genepair_stitch_respects_block_majority_strand(tmp_path, capsys):
+    # Block 1 is 2 '+' segments and 1 '-' segment: majority '+', so it pairs with the '+'
+    # block 2 and the synthetic record is '+'.
+    mixed = gene_pairs(1, 0, 0)[:2] + [rec(2 * M, 3 * M, 2 * M, 3 * M, "-", 1)]
+    out = spans(run(tmp_path, capsys, mixed + gene_pairs(2, 4 * M, 4 * M), threshold=0))
+    assert (3.0, 4.0, 3.0, 4.0, "+") in out
+
+
+def test_opposite_strand_block_between_genepair_blocks_blocks_the_stitch(tmp_path, capsys):
+    inverted = gene_pairs(9, 3 * M, 3 * M, n=1, strand="-")
+    lines = gene_pairs(1, 0, 0) + inverted + gene_pairs(2, 4 * M, 4 * M)
+    out = spans(run(tmp_path, capsys, lines, threshold=0))
+    # only the inverted record itself may occupy that span -- no '+' stitch over it
+    assert [s for s in out if s[:4] == (3.0, 4.0, 3.0, 4.0)] == [(3.0, 4.0, 3.0, 4.0, "-")]
+
+
+def test_records_without_a_block_id_still_stitch(tmp_path, capsys):
+    # Legacy 3-column coords: no block id, so each record must count as its own block.
+    p = tmp_path / "legacy.coords"
+    p.write_text(f"A_chr1:0..{2 * M}\tB_chr1:0..{2 * M}\t+\n"
+                 f"A_chr1:{3 * M}..{6 * M}\tB_chr1:{3 * M}..{6 * M}\t+\n")
+    cons.process_file(str(p), 0, True)
+    out = spans(capsys.readouterr().out.splitlines())
+    assert (2.0, 3.0, 2.0, 3.0, "+") in out

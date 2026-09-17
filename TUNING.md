@@ -134,8 +134,10 @@ defaults.
     chromosomes were stitched across up to 75 Mb (313 of 1,666 stitches). Those fake blocks
     displaced real blocks in 8 of 27 runs. With it, 800 stitches remain: 2 non-homologous (both
     under 0.3 Mb) and none over 10 Mb.
-  - **Genepair:** block edges are locally scrambled, so the guards usually refuse; the final
-    genepair runs stitched nothing.
+  - **Genepair:** stitching compares block *extents*, so it fills the same gaps under
+    `-partition genepair` as under `block` (an earlier version compared single records, and a
+    genepair record is one gene-to-gene interval — far too small to judge a gap by, so nothing
+    was ever stitched).
 
 ### Is a sparse proteome hiding real structure?
 

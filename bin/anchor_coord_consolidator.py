@@ -12,13 +12,14 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool,
     Only lines where at least one side is "fail" are eligible to merge, so a merge
     never crosses a syntenic block.
 
-    If --stitch-gaps is set, after merging we insert synthetic lines to fill gaps
-    between consecutive records of the same (pair1_id, pair2_id, strand) -- ACROSS
-    blocks, since that is the only place a gap exists -- whenever both sequences have
-    a positive gap. Touching intervals (no gap) are not stitched. Guards: no opposite-
-    strand record in the gap, consecutive in both genomes, gap sizes within
-    max_stitch_ratio of each other, and each gap no longer than stitch_flank_factor x the
-    smaller neighbouring block on that genome.
+    If --stitch-gaps is set, after merging we insert synthetic lines to fill the gaps
+    between consecutive syntenic BLOCKS of the same (pair1_id, pair2_id, strand), whenever
+    both sequences have a positive gap. A block's extent is the span of its records, so this
+    behaves the same under -partition block (a block is one record) and genepair (a block is
+    many gene-pair segments, and only its outer edges bound a real gap). Touching blocks are
+    not stitched. Guards: no opposite-strand block in the gap, consecutive in both genomes,
+    gap sizes within max_stitch_ratio of each other, and each gap no longer than
+    stitch_flank_factor x the smaller neighbouring block on that genome.
     """
     # ---------- parsing ----------
     bins = {}
@@ -128,103 +129,102 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool,
     if stitch_gaps:
         from collections import defaultdict
 
-        # Index all records per (pair1_id, pair2_id) across BOTH strands (for opposite-strand guard)
-        pair_index = defaultdict(list)
-        for _bin_key, _lines in final_bins.items():
-            for rec in _lines:
-                pair_index[(rec[0], rec[3])].append(rec)
+        # Stitching works on BLOCK EXTENTS, not on single records. Under -partition block a
+        # block IS one record, so this changes nothing there. Under genepair a block is many
+        # gene-pair segments; only the block's outer edges bound a real gap, and the segments
+        # bordering one are too small (and too locally scrambled) to judge it by themselves.
+        extents = {}
+        for lines in final_bins.values():
+            for rec in lines:
+                # A record with no block id (legacy 3-column coords) is its own block.
+                key = (rec[0], rec[3], rec[11] or f"__rec{id(rec)}")
+                e = extents.get(key)
+                if e is None:
+                    e = extents[key] = {"p1": rec[0], "p2": rec[3], "blk": rec[11],
+                                        "a0": rec[1], "a1": rec[2], "b0": rec[4], "b1": rec[5],
+                                        "plus": 0, "minus": 0, "bin": rec[9]}
+                e["a0"] = min(e["a0"], rec[1]); e["a1"] = max(e["a1"], rec[2])
+                e["b0"] = min(e["b0"], rec[4]); e["b1"] = max(e["b1"], rec[5])
+                e["plus" if rec[6] == "+" else "minus"] += rec[2] - rec[1]
+        for e in extents.values():
+            # bp-weighted majority, matching how riparian judges a block's orientation.
+            e["strand"] = "+" if e["plus"] >= e["minus"] else "-"
+
+        by_pair = defaultdict(list)
+        for e in extents.values():
+            by_pair[(e["p1"], e["p2"])].append(e)
 
         def has_opposite_strand_between(prev, nxt):
-            # Gap windows on both sequences
-            gap1_start, gap1_end = prev[2], nxt[1]
-            gap2_start, gap2_end = prev[5], nxt[4]
+            gap1_start, gap1_end = prev["a1"], nxt["a0"]
+            gap2_start, gap2_end = prev["b1"], nxt["b0"]
             if not (gap1_end > gap1_start and gap2_end > gap2_start):
                 return False  # nothing to check
-
-            for cand in pair_index[(prev[0], prev[3])]:
-                if cand is prev or cand is nxt:
+            for cand in by_pair[(prev["p1"], prev["p2"])]:
+                if cand is prev or cand is nxt or cand["strand"] == prev["strand"]:
                     continue
-                # only consider opposite strand
-                if cand[6] == prev[6]:
-                    continue
-                # if an opposite-strand block overlaps BOTH gap windows, it "occupies" the gap
-                if (cand[1] <= gap1_end and cand[2] >= gap1_start) and \
-                   (cand[4] <= gap2_end and cand[5] >= gap2_start):
+                # an opposite-strand block overlapping BOTH gap windows "occupies" the gap
+                if (cand["a0"] <= gap1_end and cand["a1"] >= gap1_start) and \
+                   (cand["b0"] <= gap2_end and cand["b1"] >= gap2_start):
                     return True
             return False
 
-        # Stitch groups span blocks. The merge bins above carry the block id so a merge can
-        # never run across blocks, but a gap only ever exists BETWEEN blocks: stitching within
-        # a merge bin (as after 829e382) can never find one. Group by chromosome pair + strand.
-        stitch_groups = defaultdict(list)
-        for _lines in final_bins.values():
-            for rec in _lines:
-                stitch_groups[(rec[0], rec[3], rec[6])].append(rec)
+        groups = defaultdict(list)
+        for e in extents.values():
+            groups[(e["p1"], e["p2"], e["strand"])].append(e)
 
-        for lines in stitch_groups.values():
-            if len(lines) < 2:
+        for group in groups.values():
+            if len(group) < 2:
                 continue
+            by_a = sorted(group, key=lambda e: (e["a0"], e["b0"]))
+            by_b = sorted(group, key=lambda e: (e["b0"], e["a0"]))
+            pos_in_b = {id(e): i for i, e in enumerate(by_b)}
 
-            # Build dual orderings within THIS group (same pair1_id, pair2_id, strand)
-            lines_by_p1 = sorted(lines, key=lambda x: (x[1], x[4]))  # pair1_start then pair2_start
-            lines_by_p2 = sorted(lines, key=lambda x: (x[4], x[1]))  # pair2_start then pair1_start
-
-            # Map "identity" of a record to its index in pair2-order for quick adjacency checks
-            pos_in_p2 = {id(rec): idx for idx, rec in enumerate(lines_by_p2)}
-
-            for prev, nxt in zip(lines_by_p1, lines_by_p1[1:]):
-
+            for prev, nxt in zip(by_a, by_a[1:]):
                 # Positive gaps on both sequences?
-                gap1_start, gap1_end = prev[2], nxt[1]
-                gap2_start, gap2_end = prev[5], nxt[4]
+                gap1_start, gap1_end = prev["a1"], nxt["a0"]
+                gap2_start, gap2_end = prev["b1"], nxt["b0"]
                 if not (gap1_end > gap1_start and gap2_end > gap2_start):
                     continue  # no stitch for touching/overlapping
 
-                # NEW GUARD #1: Opposite strand occupying the gap → skip
+                # GUARD #1: an inversion sits in the gap
                 if has_opposite_strand_between(prev, nxt):
                     continue
 
-                # NEW GUARD #2: Dual-order adjacency check
-                j = pos_in_p2[id(prev)]
-                k = pos_in_p2[id(nxt)]
-                if abs(j - k) != 1:
-                    # Not consecutive in pair2 order → bogus stitch, skip
+                # GUARD #2: the two blocks must be consecutive in BOTH genomes
+                if abs(pos_in_b[id(prev)] - pos_in_b[id(nxt)]) != 1:
                     continue
 
-                # GUARD #3: the two gaps must be of comparable size. A stitch
-                # asserts "these two spans are each other's counterpart"; 50 Mb
-                # against 10 Mb asserts something the anchors never showed. Such a
-                # record is unalignable end-to-end and previously became either a
-                # length_ratio skip or a timeout -- a segment invented here and then
-                # thrown away downstream.
+                # GUARD #3: the two sides of the gap must be of comparable size. A 50 Mb
+                # against 5 Mb stitch asserts a correspondence the anchors never showed, and
+                # the record is unalignable end to end.
                 g1 = gap1_end - gap1_start
                 g2 = gap2_end - gap2_start
                 if max_stitch_ratio > 0 and max(g1, g2) > max_stitch_ratio * min(g1, g2):
                     continue
 
-                # GUARD #4: the gap must be backed by synteny on both sides -- no longer
-                # than stitch_flank_factor x the smaller neighbouring block, on each genome.
+                # GUARD #4: the gap must be backed by synteny on both sides -- no longer than
+                # stitch_flank_factor x the smaller neighbouring BLOCK, on each genome.
                 # Without it, two tiny spurious blocks on a non-homologous chromosome pair
-                # pass every guard above and were stitched across 75 Mb, and the fake block
-                # then displaced real (rescued) blocks in the riparian plot. Same principle
-                # as paf_chain_blocks.py --max-gap-factor.
+                # were stitched across 75 Mb, and the fake block then displaced real (rescued)
+                # blocks in the riparian plot. Same principle as paf_chain_blocks.py
+                # --max-gap-factor.
                 if stitch_flank_factor > 0 and (
-                        g1 > stitch_flank_factor * min(prev[2] - prev[1], nxt[2] - nxt[1]) or
-                        g2 > stitch_flank_factor * min(prev[5] - prev[4], nxt[5] - nxt[4])):
+                        g1 > stitch_flank_factor * min(prev["a1"] - prev["a0"],
+                                                       nxt["a1"] - nxt["a0"]) or
+                        g2 > stitch_flank_factor * min(prev["b1"] - prev["b0"],
+                                                       nxt["b1"] - nxt["b0"])):
                     continue
 
-                # All guards pass: insert the synthetic record into the left neighbour's
-                # bin, so it prints right after that record and the order of existing
-                # records never changes.
-                final_bins[prev[9]].append([
-                    prev[0], gap1_start, gap1_end,
-                    prev[3], gap2_start, gap2_end,
-                    prev[6],
-                    gap1_end - gap1_start,
-                    gap2_end - gap2_start,
-                    prev[9],
+                # All guards pass: insert the synthetic record into the left block's bin, so it
+                # prints among that block's records and the order of existing records is kept.
+                final_bins[prev["bin"]].append([
+                    prev["p1"], gap1_start, gap1_end,
+                    prev["p2"], gap2_start, gap2_end,
+                    prev["strand"],
+                    g1, g2,
+                    prev["bin"],
                     "stitched",  # internal marker; output format ignores this
-                    prev[11]     # block id of the left neighbour; nothing downstream reads it
+                    prev["blk"]  # block id of the left neighbour; nothing downstream reads it
                 ])
 
     # ---------- output ----------

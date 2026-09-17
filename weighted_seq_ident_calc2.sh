@@ -48,7 +48,8 @@ ALIGN="yes"
 RESUME="yes"
 # block    = span each syntenic block end to end (historical).
 # genepair = span adjacent gene pairs within a block. The consolidator still runs: its merge is
-#            confined to one block, and stitching rarely fires because block edges are scrambled.
+#            confined to one block, and stitching works on block extents, so the same
+#            between-block gaps are filled as under 'block'.
 # genepair is the default: it tiles the genome once with small, evenly sized
 # segments, and it discarded ~100x less sequence than block did in benchmarking.
 # block is still supported and now genuinely cuts each syntenic block once, end to
@@ -1257,14 +1258,22 @@ if [[ "$RIPARIAN" == "yes" ]]; then
             riparian_order+=",${GENOME_IDS[$genome]}"
         done
 
-        echo "Running: python $BIN_DIR/riparian.py --coords ${riparian_coords[*]} --fai ${riparian_fais[*]} --order $riparian_order --scale bp -o riparian ${flip_opts[*]}"
+        # riparian's block-scale filters (10 kb floor, 5x length skew) are meant for whole
+        # syntenic blocks. A genepair record is one gene-to-gene interval, where extreme skew
+        # is the normal signature of an expanded region rather than a chaining artefact, so
+        # those filters drop legitimate segments -- 13% of PaA on the Poa data -- and punch
+        # holes the block plot does not have. Draw every segment instead.
+        riparian_opts=(--scale bp -o riparian "${flip_opts[@]}")
+        if [[ "$PARTITION" == "genepair" ]]; then
+            riparian_opts+=(--min-block-len 0 --max-len-ratio 0)
+        fi
+
+        echo "Running: python $BIN_DIR/riparian.py --coords ${riparian_coords[*]} --fai ${riparian_fais[*]} --order $riparian_order ${riparian_opts[*]}"
         python "$BIN_DIR/riparian.py" \
             --coords "${riparian_coords[@]}" \
             --fai "${riparian_fais[@]}" \
             --order "$riparian_order" \
-            --scale bp \
-            -o riparian \
-            "${flip_opts[@]}"
+            "${riparian_opts[@]}"
     fi
 fi
 

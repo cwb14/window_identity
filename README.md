@@ -110,6 +110,20 @@ strand as its main partner above, so homologs do not draw as a twist.
   with a prime (`chr2′`). To redraw an existing run, delete `riparian.*` in its output
   directory and rerun; resume skips everything else.
 
+#### Which ribbons get drawn
+
+riparian discards two kinds of block before drawing: anything under 10 kb (`--min-block-len`), and
+anything whose two sides differ in length by more than 5× (`--max-len-ratio`), which is the
+signature of a chained-through-junk block that cannot be drawn as a ribbon. A block that fails the
+ratio test is kept anyway ("rescued") if it is the only thing covering more than half of its span
+on both genomes, so a genuinely expanded region is not silently dropped.
+
+These are *block*-scale rules. Under `-partition genepair` a record is one gene-to-gene interval,
+where extreme length skew is the normal signature of an expanded region rather than a chaining
+artefact, so the pipeline turns both filters off (`--min-block-len 0 --max-len-ratio 0`) in that
+mode. Left on, they dropped 13% of PaA on the *Poa* data — 144.7 Mb over 632 segments — and punched
+holes the block plot did not have. Both modes now draw 100% of `*.anchors.coords`.
+
 #### Synonymous divergence (Ks)
 On by default. The syntenic anchors are already ortholog pairs, so the same liftover that
 feeds the synteny front-end also yields in-frame CDS (`cds_walker.py`), and the two are
@@ -238,9 +252,13 @@ A gap is stitched only if all of these hold:
   Without this last guard, two tiny spurious blocks on non-homologous chromosomes were bridged
   across up to 75 Mb, and those fake blocks displaced real ones in the riparian plot.
 
-Stitching mostly acts under `-partition block`. Under `genepair` the segments at block edges
-are locally scrambled, so the guards usually refuse; the final *Poa* genepair runs stitched
-nothing.
+Stitching judges **block extents**, not individual records: a block's extent is the span of its
+records. Under `-partition block` a block is one record, so this is the same thing. Under
+`genepair` a block is many gene-pair segments — only the block's outer edges bound a real gap,
+and the segments bordering one are far too small and too locally scrambled to judge it by
+themselves. Working on extents therefore fills the same gaps in both modes. (Where a genepair
+extent stops short of the block's outer edge the flank guard can still refuse, so the genepair
+run occasionally makes one stitch fewer; where both fire they agree exactly.)
 
 (An earlier version grouped stitching by block id as well, so it could never find a gap and
 silently did nothing. Re-scored with stitching restored and guarded, the 27-run sweep kept
