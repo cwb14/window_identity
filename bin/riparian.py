@@ -12,7 +12,9 @@ Inputs
              seq:start..end <TAB> seq:start..end <TAB> strand
   fai    : samtools faidx index; column 1 = seq name, column 2 = length
 
-Outputs: <prefix>.pdf, <prefix>.png, <prefix>.html (interactive zoom/pan).
+Outputs: <prefix>.pdf, <prefix>.png, <prefix>.html (interactive zoom/pan), and
+<prefix>.orientation.tsv (each chromosome pair's relative orientation, and whether the
+lower chromosome was drawn reverse-complemented).
 
 python riparian.py --coords Ahall.Aare.anchors.coords Athal.Aare.anchors.coords Athal.Ahall.anchors.coords --fai Athal.fa.fai Ahall.fa.fai Aare.fa.fai --order Athal,Ahall,Aare -o riparian --scale bp
 """
@@ -201,6 +203,13 @@ CHROM_MAX_COUNT = 200     # chromosomes are FEW
 CHROM_MIN_FRAC = 0.30     # chromosomes ARE the genome (rejects fragmented assemblies)
 CHROM_MIN_FOLD = 2.0      # the size drop must be a cliff, not a gradient
 CHROM_PURE_RATIO = 0.10   # no junk class at all: everything is chromosome-scale
+
+# Block filters (filter_pair_blocks). Module constants rather than argparse literals so
+# dotplot.py judges orientation from exactly the blocks riparian draws.
+MIN_BLOCK_LEN = 10000
+MAX_LEN_RATIO = 5.0
+RESCUE_UNCOVERED = 0.5
+RESCUE_RULE = "both"
 
 
 def header_signature(name):
@@ -431,13 +440,72 @@ class Track:
         return self.x(chrom, coord) / self.denom
 
 
-def _weighted_cov(xs, ys, ws):
-    xs, ys, ws = np.asarray(xs, float), np.asarray(ys, float), np.asarray(ws, float)
-    W = ws.sum()
-    if W <= 0:
-        return 0.0
-    mx, my = (ws * xs).sum() / W, (ws * ys).sum() / W
-    return float((ws * (xs - mx) * (ys - my)).sum() / W)
+def filter_pair_blocks(blocks, up, dn, genome_chroms, min_block_len, max_len_ratio,
+                       rescue_uncovered, rescue_rule):
+    """The blocks drawn between genomes `up` and `dn`, and what was filtered out.
+
+    Transposes every block so side 'a' is `up`, drops blocks off the called chromosomes
+    or shorter than min_block_len on either side, then triages length-skewed blocks
+    (triage_blocks). Shared by riparian and dotplot.py so both judge orientation from
+    exactly the same blocks.
+    """
+    survivors, n_off, n_small = [], 0, 0
+    for b in blocks:
+        if b["ga"] == dn:      # transpose so 'a' is always the upper genome
+            b = {"ga": b["gb"], "ca": b["cb"], "sa": b["sb"], "ea": b["eb"],
+                 "gb": b["ga"], "cb": b["ca"], "sb": b["sa"], "eb": b["ea"],
+                 "strand": b["strand"]}
+        if b["ca"] not in genome_chroms[up] or b["cb"] not in genome_chroms[dn]:
+            n_off += 1
+            continue
+        if min(b["ea"] - b["sa"], b["eb"] - b["sb"]) < min_block_len:
+            n_small += 1
+            continue
+        survivors.append(b)
+    clean, rescued, dropped = triage_blocks(survivors, max_len_ratio, rescue_uncovered,
+                                            rescue_rule)
+    stats = {"raw": len(blocks), "off_chrom": n_off, "small": n_small,
+             "clean": len(clean), "rescued": len(rescued), "dropped": len(dropped)}
+    return clean + rescued, stats
+
+
+def relative_orientation(blocks):
+    """Lower chromosome -> its dominant partner above and how the two are oriented.
+
+    Returns {cb: {"partner": ca, "bp": syntenic bp to that partner (lower side),
+    "opposite_bp": the part of it on '-' blocks}}. The partner is the chromosome above
+    carrying the most bp: pooling partners would mix unrelated relationships.
+    """
+    mass = {}
+    for b in blocks:
+        m = mass.setdefault(b["cb"], {})
+        bp, opp = m.get(b["ca"], (0, 0))
+        L = b["eb"] - b["sb"]
+        m[b["ca"]] = (bp + L, opp + (L if b["strand"] == "-" else 0))
+    calls = {}
+    for cb, m in mass.items():
+        dom = max(m, key=lambda ca: m[ca][0])
+        calls[cb] = {"partner": dom, "bp": m[dom][0], "opposite_bp": m[dom][1]}
+    return calls
+
+
+def write_orientation(path, order, tracks, pair_blocks):
+    """One row per lower chromosome: its partner above, their relative orientation in
+    the assemblies, and whether it was drawn reverse-complemented. Replaces the prime
+    mark that used to flag flipped chromosomes on the figure itself."""
+    with open(path, "w") as fh:
+        fh.write("# orientation: '+' same strand, '-' opposite strand in the assemblies "
+                 "(bp-weighted over the pair's syntenic blocks)\n")
+        fh.write("upper\tlower\torientation\topposite_frac\tflipped_in_plot\n")
+        for up, dn in zip(order, order[1:]):
+            calls = relative_orientation(pair_blocks[(up, dn)])
+            for cb in tracks[dn].order:
+                if cb not in calls:
+                    continue
+                c = calls[cb]
+                frac = c["opposite_bp"] / c["bp"] if c["bp"] else 0.0
+                fh.write(f'{c["partner"]}\t{cb}\t{"-" if frac > 0.5 else "+"}\t{frac:.2f}\t'
+                         f'{"yes" if tracks[dn].flip[cb] else "no"}\n')
 
 
 def optimise_track(track, prev_track, blocks, do_order=True, do_flip=True):
@@ -445,31 +513,27 @@ def optimise_track(track, prev_track, blocks, do_order=True, do_flip=True):
 
     Order: each chromosome goes to the length-weighted mean x of its partners on
     the track above, so ribbons run as vertically as possible.
-    Flip: sign of the length-weighted covariance between the partner's *laid-out*
-    x (which already absorbs that partner's own flip) and this chromosome's bp
-    coordinate. Negative covariance means the chromosome reads backwards.
+    Flip: bp-weighted vote of block strands against the dominant partner, reversed
+    when that partner is itself displayed flipped. A '-' majority means the
+    chromosome reads backwards, so flipping it draws the relationship untwisted.
+
+    This replaced the sign of the covariance between block positions, which needs
+    two blocks: a chromosome carried by one inverted whole-chromosome block could not
+    be judged and drew as a twist, while a split one was flipped. Strand is reliable
+    here because block orientation is itself a majority vote over every anchor
+    (gene_coords_extractor_all4.block_orientation). A minority inverted block keeps
+    its twist, which is real structure.
     """
     by_chrom = {}
     for b in blocks:
         by_chrom.setdefault(b["cb"], []).append(b)
 
     if do_flip:
-        for c, bl in by_chrom.items():
-            # Judge orientation against the single partner carrying the most bp:
-            # pooling partners would mix unrelated x-offsets and blur the sign.
-            mass = {}
-            for b in bl:
-                mass[b["ca"]] = mass.get(b["ca"], 0) + (b["eb"] - b["sb"])
-            dom = max(mass, key=mass.get)
-            xs, ys, ws = [], [], []
-            for b in bl:
-                if b["ca"] != dom:
-                    continue
-                w = b["eb"] - b["sb"]
-                xs.append(prev_track.xn(b["ca"], (b["sa"] + b["ea"]) / 2.0))
-                ys.append((b["sb"] + b["eb"]) / 2.0)
-                ws.append(w)
-            if len(xs) >= 2 and _weighted_cov(xs, ys, ws) < 0:
+        for c, call in relative_orientation(blocks).items():
+            vote = call["bp"] - 2 * call["opposite_bp"]      # same-strand minus opposite bp
+            if prev_track.flip[call["partner"]]:
+                vote = -vote          # a reversed partner reverses how every ribbon reads
+            if vote < 0:
                 track.flip[c] = True
 
     if do_order:
@@ -791,9 +855,8 @@ def render_mpl(scene, out_paths, width, height, dpi, alpha, linewidth):
             facecolor="none" if bar["segs"] else "#FFFFFF",
             edgecolor="#333333", linewidth=linewidth, zorder=3.5))
 
+        # Flipped chromosomes are not marked here; see <prefix>.orientation.tsv.
         label = re.sub(r"^.*?_", "", bar["chrom"])
-        if bar["flip"]:
-            label += "′"      # prime mark = reverse-complemented for display
         ax.text((bar["x0"] + bar["x1"]) / 2, bar["y"] + bar["h"] / 2, label,
                 ha="center", va="center", fontsize=6.5, zorder=4, color="#000000",
                 path_effects=[pe.withStroke(linewidth=1.8, foreground="white")])
@@ -1019,7 +1082,7 @@ def render_html(scene, out_path, alpha, linewidth, px_w=1500, px_track=250):
             f'<title>{html.escape(bar["chrom"])} &#183; {bar["len"]:,} bp'
             f'{" &#183; displayed reverse-complemented" if bar["flip"] else ""}</title></rect>'
         )
-        label = html.escape(re.sub(r"^.*?_", "", bar["chrom"]) + ("′" if bar["flip"] else ""))
+        label = html.escape(re.sub(r"^.*?_", "", bar["chrom"]))
         o.append(
             f'      <text x="{(x0 + x1) / 2:.2f}" y="{y + h / 2:.2f}" text-anchor="middle" '
             f'dominant-baseline="central" font-size="10" pointer-events="none" '
@@ -1090,21 +1153,21 @@ def main(argv=None):
                         "Default: order the --fai files were given.")
     p.add_argument("-o", "--out-prefix", default="riparian", help="output path prefix")
     p.add_argument("--formats", default="pdf,png,html", help="comma-separated: pdf,png,html")
-    p.add_argument("--min-block-len", type=int, default=10000,
+    p.add_argument("--min-block-len", type=int, default=MIN_BLOCK_LEN,
                    help="drop syntenic blocks shorter than this on either side (bp; 0 = keep all)")
-    p.add_argument("--max-len-ratio", type=float, default=5.0,
+    p.add_argument("--max-len-ratio", type=float, default=MAX_LEN_RATIO,
                    help="a block whose two sides differ in length by more than this factor "
                         "is called degenerate: an anchor chain dragged out by one distant "
                         "outlier, spanning megabases on one genome and kilobases on the "
                         "other. Degenerate blocks are not dropped outright -- see "
                         "--rescue-uncovered. (0 = treat none as degenerate)")
-    p.add_argument("--rescue-uncovered", type=float, default=0.5,
+    p.add_argument("--rescue-uncovered", type=float, default=RESCUE_UNCOVERED,
                    help="keep a degenerate block if at least this fraction of its span is "
                         "territory no clean block already covers. Skew alone does not condemn "
                         "a block -- skew plus redundancy does; a degenerate block over an "
                         "otherwise-empty locus is the only evidence there is. "
                         "(0 = keep every degenerate block; >1 = drop them all)")
-    p.add_argument("--rescue-rule", choices=("both", "either"), default="both",
+    p.add_argument("--rescue-rule", choices=("both", "either"), default=RESCUE_RULE,
                    help="'both': a degenerate block must open new territory on BOTH sides to "
                         "be rescued. 'either': one side suffices -- but a degenerate block's "
                         "short side is nearly always novel, so this rescues almost everything "
@@ -1196,35 +1259,20 @@ def main(argv=None):
         key = frozenset((up, dn))
         if key not in by_pair:
             die(f"no coords file for adjacent pair {up} / {dn}")
-        survivors, n_raw, n_off, n_small = [], 0, 0, 0
-        for b in by_pair[key]:
-            n_raw += 1
-            if b["ga"] == dn:      # transpose so 'a' is always the upper genome
-                b = {"ga": b["gb"], "ca": b["cb"], "sa": b["sb"], "ea": b["eb"],
-                     "gb": b["ga"], "cb": b["ca"], "sb": b["sa"], "eb": b["ea"],
-                     "strand": b["strand"]}
-            if b["ca"] not in genome_chroms[up] or b["cb"] not in genome_chroms[dn]:
-                n_off += 1
-                continue
-            if min(b["ea"] - b["sa"], b["eb"] - b["sb"]) < a.min_block_len:
-                n_small += 1
-                continue
-            survivors.append(b)
-
-        clean, rescued, dropped = triage_blocks(survivors, a.max_len_ratio,
-                                                a.rescue_uncovered, a.rescue_rule)
-        kept = clean + rescued
+        kept, st = filter_pair_blocks(by_pair[key], up, dn, genome_chroms, a.min_block_len,
+                                      a.max_len_ratio, a.rescue_uncovered, a.rescue_rule)
         if not kept:
             die(f"no blocks survive filtering for {up} / {dn}")
         pair_blocks[(up, dn)] = kept
 
-        tlog(f"  {up} <-> {dn}: {len(kept):,}/{n_raw:,} blocks kept "
+        tlog(f"  {up} <-> {dn}: {len(kept):,}/{st['raw']:,} blocks kept "
              f"[{os.path.basename(used[key])}]")
-        tlog(f"      {len(clean):,} clean, {len(rescued):,} rescued "
+        tlog(f"      {st['clean']:,} clean, {st['rescued']:,} rescued "
              f"(length-skewed > {a.max_len_ratio:g}x but filling territory no clean "
-             f"block reaches), {len(dropped):,} dropped as redundant", a.verbose)
-        tlog(f"      also dropped: {n_off:,} off-chromosome, {n_small:,} < "
+             f"block reaches), {st['dropped']:,} dropped as redundant", a.verbose)
+        tlog(f"      also dropped: {st['off_chrom']:,} off-chromosome, {st['small']:,} < "
              f"{a.min_block_len:,} bp", a.verbose)
+        rescued = [b for b in kept if b.get("rescued")]
         for b in sorted(rescued, key=lambda x: -x["ratio"])[:8]:
             tlog(f"        rescued {b['ratio']:6.1f}x  {b['novelty']:.0%} new  "
                  f"{b['ca']}:{b['sa']:,}-{b['ea']:,} <-> "
@@ -1268,6 +1316,10 @@ def main(argv=None):
             flipped = [c for c in tracks[dn].order if tracks[dn].flip[c]]
             tlog(f"  {dn}: {' '.join(tracks[dn].order)}"
                  + (f"   (flipped: {', '.join(flipped)})" if flipped else ""))
+
+    orient_path = f"{a.out_prefix}.orientation.tsv"
+    write_orientation(orient_path, order, tracks, pair_blocks)
+    tlog(f"  wrote {orient_path}")
 
     palette = build_palette(list(genome_chroms[ref_genome]))
     scene = build_scene(order, tracks, pair_blocks, palette, ref_genome,

@@ -63,6 +63,37 @@ def directionality(coords_1, coords_2, coords_3, coords_4):
         return None
     return "+" if same_1 else "-"
 
+
+def block_orientation(anchors):
+    """Orientation of a whole syntenic block from ALL of its anchor pairs.
+
+    `anchors` is a list of (species-1 coords, species-2 coords) tuples, each
+    (chrom, start, end, strand). Every anchor votes with its relative gene strand -- the
+    per-pair call directionality() validated at 100% -- and the majority wins.
+
+    Judging a block by its first and last anchors alone gave a single minority anchor at a
+    block end the whole label. On Poa that labelled perfectly collinear, whole-chromosome
+    blocks backwards (PaA/PiA chr6: 1,747 anchors, 98% opposite-strand, labelled '+'),
+    and riparian drew them as the wrong ribbon.
+
+    An exact tie falls back to anchor order (sign of the covariance of the two genomes'
+    anchor positions), and only then to the first anchor.
+    """
+    if not anchors:
+        raise ValueError("block_orientation needs at least one anchor pair")
+    same = sum(a[3] == b[3] for a, b in anchors)
+    opposite = len(anchors) - same
+    if same != opposite:
+        return "+" if same > opposite else "-"
+
+    xs = [(a[1] + a[2]) / 2 for a, _ in anchors]
+    ys = [(b[1] + b[2]) / 2 for _, b in anchors]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    if cov:
+        return "+" if cov > 0 else "-"
+    return "+" if anchors[0][0][3] == anchors[0][1][3] else "-"
+
 def read_gene_ids_file(gene_ids_filename):
     clusters = []
     with open(gene_ids_filename, 'r') as f:
@@ -97,7 +128,7 @@ def process_clusters(clusters, gene_coords):
     merge bins, so merging can never cross a block boundary.
     """
     output_strings = []
-    n_straddle = 0
+    n_mixed = 0
     for block_id, cluster in enumerate(clusters, start=1):
         if not cluster:
             continue
@@ -125,22 +156,22 @@ def process_clusters(clusters, gene_coords):
                   file=sys.stderr)
             continue
 
-        strand = directionality(coords_1, coords_2, coords_3, coords_4)
-        if strand is None:
-            # Anchors disagree: the span crosses an inversion boundary, so no single
-            # orientation is right. Take the first anchor's call and let the aligner's
-            # sequence-level orientation check settle it.
-            strand = "+" if coords_1[3] == coords_2[3] else "-"
-            n_straddle += 1
+        # Every anchor on this block's two sequences votes (see block_orientation).
+        anchors = [(gene_coords[a], gene_coords[b]) for a, b in cluster
+                   if a in gene_coords and b in gene_coords
+                   and gene_coords[a][0] == coords_1[0] and gene_coords[b][0] == coords_2[0]]
+        strand = block_orientation(anchors)
+        if len({a[3] == b[3] for a, b in anchors}) > 1:
+            n_mixed += 1
 
         left_span = f"{coords_1[0]}:{min(coords_1[1], coords_3[1])}..{max(coords_1[2], coords_3[2])}"
         right_span = f"{coords_2[0]}:{min(coords_2[1], coords_4[1])}..{max(coords_2[2], coords_4[2])}"
 
         output_strings.append(f"{left_span}\t{right_span}\t{strand}\t{block_id}")
-    if n_straddle:
-        print(f"NOTE: {n_straddle} of {len(output_strings)} spans straddle an inversion "
-              f"boundary (the block's first and last anchor disagree on orientation); "
-              f"used the first anchor's call", file=sys.stderr)
+    if n_mixed:
+        print(f"NOTE: {n_mixed} of {len(output_strings)} blocks contain anchors of both "
+              f"relative strands; each was labelled by majority vote of its anchors",
+              file=sys.stderr)
     return output_strings
 
 def parse_species_from_mcscan(mcscan_filename):

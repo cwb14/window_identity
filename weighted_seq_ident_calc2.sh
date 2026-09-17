@@ -60,6 +60,11 @@ KS_RATE=1.5e-8
 KS_MAX=2.0
 # Step 22. Reads only the per-pair anchors and the FAI, so it runs regardless of -align.
 RIPARIAN="yes"
+# Step 23. bp-scaled anchor dotplot per genome pair (Ks-coloured under -kaks yes).
+DOTPLOT="yes"
+# Reverse query chromosomes in the riparian plot and dotplot so homologs draw on the same
+# strand. Display only.
+FLIP="yes"
 
 # Help menu function
 usage() {
@@ -78,6 +83,9 @@ Options:
   -window_size SIZE            Window size (default: $WINDOW_SIZE)
   -slide_size SIZE             Slide size (default: $SLIDE_SIZE)
   -peptide FILE                Protein file (default: $PROTEIN)
+                               The biggest lever on synteny continuity: a small,
+                               evidence-supported proteome (~one model per locus) gives far
+                               fewer gaps than a large or isoform-rich one. See TUNING.md.
   -threads N                   Number of threads (default: $THREADS)
   -processes N                 Number of processes (default: $PROCESSES)
   -mutation_rate RATE          Mutation rate (default: $MUTATION_RATE)
@@ -100,21 +108,25 @@ Options:
                                killed run keeps every segment it finished and aligns only
                                the remainder. 'no' recomputes every step, overwriting
                                outputs in place.
-  -partition block|genepair    Step 10 segment granularity (default: $PARTITION).
-                               'genepair' spans adjacent gene pairs and skips the
-                               consolidator.
+  -partition block|genepair    Segment granularity (default: $PARTITION). 'block' cuts each
+                               syntenic block end to end (use for riparian figures);
+                               'genepair' spans adjacent anchor gene pairs.
   -max_len_ratio N             Skip segments whose length ratio exceeds N; 0 disables
                                (default: $MAX_LEN_RATIO)
   -outn N                      miniprot --outn: max alignments reported per protein
-                               (default: $OUTN). Raise for polyploids.
+                               (default: $OUTN). Use 1 for haploid or subgenome-split
+                               assemblies (fewer paralog copies, more continuous blocks);
+                               raise only when homoeologs share one FASTA.
   -outs FLOAT                  miniprot --outs: keep alignments scoring >= this fraction of
-                               the best hit for that protein (default: $OUTS).
+                               the best hit for that protein (default: $OUTS). Lower values
+                               add paralog copies and fragment blocks; do not go lower.
   -outc FLOAT                  miniprot --outc: min fraction of the protein that must align
-                               (default: $OUTC).
+                               (default: $OUTC). Little effect on synteny continuity.
   -tesorter yes|no             Strip TE-derived peptides from the reference proteome with a
                                two-pass TEsorter + blastp screen (default: $TESORTER). TE
                                proteins seed false anchors genome-wide; leave this on unless
-                               you are certain the proteome is already TE-free. Slow.
+                               you are certain the proteome is already TE-free. Cost scales
+                               with proteome size.
                                A proteome with no detectable TEs (curated reference
                                annotations are usually already TE-filtered) passes through
                                unchanged -- the screen reports 0 removed and continues.
@@ -123,11 +135,13 @@ Options:
   -min_block_size N            Anchor blocks with BOTH sides >= N are kept as-is; smaller
                                blocks are merged into overlapping neighbours (default: $MIN_BLOCK_SIZE).
                                Larger values merge more aggressively, yielding fewer/bigger
-                               blocks and a faster minimap2 step in Step 10.
+                               blocks and a faster minimap2 step in Step 10. Acts only under
+                               -partition genepair; changes segment size, not continuity.
   -stitch_gaps yes|no          Fill the gap between consecutive syntenic blocks with a
                                synthetic block, so inter-anchor intervals are aligned rather
                                than dropped (default: $STITCH_GAPS). Guarded against inversions
-                               and rearrangements.
+                               and rearrangements. Effectively inert in practice: gaps within
+                               one block rarely exist (see README).
   -kaks yes|no                 Estimate pairwise Ks on the syntenic anchors with ParaAT +
                                KaKs_Calculator, then build the Ks density plot, distance
                                matrix, and tree (default: $KAKS). Adds the in-frame CDS to
@@ -145,7 +159,17 @@ Options:
                                (default: $KS_MAX). Above ~2, Ks is saturated and unstable.
   -riparian yes|no             Draw the syntenic ribbon (riparian) plot as the final step
                                (default: $RIPARIAN). Reads the per-pair anchors, so it is
-                               unaffected by -align no.
+                               unaffected by -align no. Also writes riparian.orientation.tsv:
+                               each chromosome pair's relative orientation (+/-) and whether
+                               the lower one was drawn reversed.
+  -dotplot yes|no              Draw a bp-scaled anchor dotplot per genome pair,
+                               {ID1}.{ID2}.dotplot.pdf/.png (default: $DOTPLOT): chromosome
+                               labels, a scale bar, and dots coloured by Ks under -kaks yes.
+                               jcvi's own {ID1}.{ID2}.pdf is still written.
+  -flip yes|no                 Reverse query chromosomes in the riparian plot and dotplot so
+                               each draws on the same strand as its main partner
+                               (default: $FLIP). Display only; 'no' shows native orientation.
+                               Delete riparian.* and *.dotplot.* to redraw an existing run.
   -h, --help                   Show this help message and exit
 EOF
 }
@@ -281,6 +305,14 @@ while [[ $# -gt 0 ]]; do
         RIPARIAN="$2"
         shift; shift
         ;;
+    -dotplot)
+        DOTPLOT="$2"
+        shift; shift
+        ;;
+    -flip)
+        FLIP="$2"
+        shift; shift
+        ;;
     *)
         echo "Error: Unknown option $1"
         usage
@@ -333,6 +365,14 @@ esac
 case "$RIPARIAN" in
     yes|no) ;;
     *) echo "Error: -riparian must be 'yes' or 'no' (got '$RIPARIAN')."; exit 1 ;;
+esac
+case "$DOTPLOT" in
+    yes|no) ;;
+    *) echo "Error: -dotplot must be 'yes' or 'no' (got '$DOTPLOT')."; exit 1 ;;
+esac
+case "$FLIP" in
+    yes|no) ;;
+    *) echo "Error: -flip must be 'yes' or 'no' (got '$FLIP')."; exit 1 ;;
 esac
 case "$ALIGNER" in
     minimap2|last|wfa) ;;
@@ -1106,7 +1146,7 @@ done <jcvi_list.txt
 
 # Step 21 - Summarise Ks, then build the density plot, distance matrix, and tree.
 if need_run "ks_genome.tsv"; then
-    echo "Step 21 - Summarising Ks (median per genome pair, 0 < Ks < $KS_MAX)"
+    echo "Step 21 - Summarising Ks (median per genome pair, 0 <= Ks < $KS_MAX)"
     python "$BIN_DIR/ks_summary.py" \
         -list jcvi_list.txt \
         -max_ks "$KS_MAX" \
@@ -1142,6 +1182,22 @@ else
     echo "Steps 20-21 - Ks estimation disabled (-kaks no). Skipping."
 fi
 
+# Steps 22-23 read one FAI per genome. Step 13 indexes the reference only, and is skipped
+# entirely under -align no.
+index_all_genomes() {
+    for genome in "${ALL_GENOMES[@]}"; do
+        id="${GENOME_IDS[$genome]}"
+        if [[ ! -s "${id}_mod.fa.fai" ]]; then
+            echo "Indexing ${id}_mod.fa"
+            samtools faidx "${id}_mod.fa"
+        fi
+    done
+}
+
+# Shared by both plots, so they reverse exactly the same chromosomes.
+flip_opts=()
+[[ "$FLIP" == "no" ]] && flip_opts+=(--no-flip)
+
 # Step 22 - Syntenic ribbon (riparian) plot.
 #
 # Reads the per-pair consolidated anchors and one FAI per genome, so it is independent of
@@ -1152,16 +1208,7 @@ if [[ "$RIPARIAN" == "yes" ]]; then
         echo "Step 22 - riparian.pdf exists. Skipping."
     else
         echo "Step 22 - Building the riparian plot"
-
-        # Every genome needs a FAI. Step 13 indexes the reference only, and is skipped
-        # entirely under -align no.
-        for genome in "${ALL_GENOMES[@]}"; do
-            id="${GENOME_IDS[$genome]}"
-            if [[ ! -s "${id}_mod.fa.fai" ]]; then
-                echo "Indexing ${id}_mod.fa"
-                samtools faidx "${id}_mod.fa"
-            fi
-        done
+        index_all_genomes
 
         riparian_coords=()
         while read -r line; do
@@ -1178,12 +1225,42 @@ if [[ "$RIPARIAN" == "yes" ]]; then
             riparian_order+=",${GENOME_IDS[$genome]}"
         done
 
-        echo "Running: python $BIN_DIR/riparian.py --coords ${riparian_coords[*]} --fai ${riparian_fais[*]} --order $riparian_order --scale bp -o riparian"
+        echo "Running: python $BIN_DIR/riparian.py --coords ${riparian_coords[*]} --fai ${riparian_fais[*]} --order $riparian_order --scale bp -o riparian ${flip_opts[*]}"
         python "$BIN_DIR/riparian.py" \
             --coords "${riparian_coords[@]}" \
             --fai "${riparian_fais[@]}" \
             --order "$riparian_order" \
             --scale bp \
-            -o riparian
+            -o riparian \
+            "${flip_opts[@]}"
     fi
+fi
+
+# Step 23 - Anchor dotplot per genome pair.
+#
+# jcvi's {ID1}.{ID2}.pdf places anchors by gene rank. This one places the same anchors at
+# gene midpoints on a shared bp scale, with chromosome labels, a scale bar, riparian's
+# orientation flips, and Ks colouring when the Ks branch ran. Like Step 22 it reads only the
+# anchors, BEDs, coords and FAIs, so it runs under -align no.
+if [[ "$DOTPLOT" == "yes" ]]; then
+    index_all_genomes
+    while read -r line; do
+        ID1=$(echo "$line" | awk '{print $1}')
+        ID2=$(echo "$line" | awk '{print $2}')
+        dotplot_prefix="${ID1}.${ID2}.dotplot"
+        if ! need_run "${dotplot_prefix}.pdf"; then
+            echo "Step 23 - ${dotplot_prefix}.pdf exists. Skipping."
+            continue
+        fi
+        dotplot_opts=(--anchors "${ID1}.${ID2}.clean.anchors"
+                      --bed "${ID1}.bed" "${ID2}.bed"
+                      --fai "${ID1}_mod.fa.fai" "${ID2}_mod.fa.fai"
+                      --coords "${ID1}.${ID2}.anchors.coords"
+                      -o "$dotplot_prefix" "${flip_opts[@]}")
+        if [[ "$KAKS" == "yes" ]]; then
+            dotplot_opts+=(--kaks "${ID1}.${ID2}.kaks.tsv" --ks-max "$KS_MAX")
+        fi
+        echo "Step 23 - Building the dotplot: python $BIN_DIR/dotplot.py ${dotplot_opts[*]}"
+        python "$BIN_DIR/dotplot.py" "${dotplot_opts[@]}"
+    done <jcvi_list.txt
 fi

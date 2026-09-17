@@ -4,6 +4,7 @@ import argparse
 import sys
 
 from gene_coords_extractor_all4 import (
+    block_orientation as _block_orientation,
     directionality as _directionality,
     get_gene_coords as _get_gene_coords,
 )
@@ -86,6 +87,10 @@ def process_pairs(blocks, gene_coords):
     for block_id, block in enumerate(blocks, start=1):
         if len(block) < 2:
             continue
+        # Fallback for segments whose two anchors disagree (below). Computed once per block.
+        anchors = [(gene_coords[a], gene_coords[b]) for a, b in block
+                   if a in gene_coords and b in gene_coords]
+        block_strand = _block_orientation(anchors) if anchors else None
         for i in range(len(block) - 1):
             geneA1, geneA2 = block[i]
             geneB1, geneB2 = block[i + 1]
@@ -105,7 +110,10 @@ def process_pairs(blocks, gene_coords):
             # gene_coords_extractor_all4.directionality() for why the order rule was wrong.
             directionality = _directionality(coords1, coords2, coords3, coords4)
             if directionality is None:
-                directionality = "+" if coords1[3] == coords2[3] else "-"
+                # The two anchors disagree. Taking the first anchor's call mislabels the
+                # segment after any single flipped anchor inside a collinear block; the
+                # block-wide majority is the better-supported guess.
+                directionality = block_strand
 
             # Build spanning coordinate ranges
             range1_start = min(coords1[1], coords3[1])

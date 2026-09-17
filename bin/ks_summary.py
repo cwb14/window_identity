@@ -10,9 +10,21 @@ jcvi_list.txt and emits:
 The genome-pair distance is the MEDIAN Ks over gene pairs. Ks has a long right tail from
 paralogous and saturated anchors, which drags the mean upward; the median does not move.
 
-Sites with Ks outside (0, max_ks) are dropped: Ks == 0 means the two CDS are identical at
-synonymous sites (no information, and it would pull a distance toward zero), and Ks above
-~2 is saturated, where the estimator is unstable and effectively unbounded.
+Gene pairs with 0 <= Ks < max_ks are kept. Above ~2 Ks is saturated, where the estimator is
+unstable and effectively unbounded.
+
+Ks 'NA' is read as 0 and kept. KaKs_Calculator 3.0 prints any Ks estimate below 1e-6 as 'NA'
+(base.cpp, parseOutput). That is a display convention, not a failure flag:
+  * no method ever assigns Ks the tool's internal NA sentinel;
+  * with zero synonymous differences, YN00 cannot fit F84/K80 and falls back to Jukes-Cantor,
+    which gives exactly 0 (DistanceF84);
+  * saturation yields large finite values (capped at 99), not 'NA'.
+Dropping every 'NA' used to discard the most similar gene pairs -- 51% of PaA/PiA anchors -- and
+biased recent divergences upward.
+
+A per-gene Ks of 0 is still only "below detection" (roughly < 1/S synonymous sites), and Ka/Ks
+is genuinely undefined there. That is a reason to be cautious about a single gene, not to drop
+it from a genome-wide distribution.
 """
 
 import argparse
@@ -43,7 +55,8 @@ def parse_args():
     p.add_argument("-list", "--list", dest="list", default="jcvi_list.txt",
                    help="Genome-pair list, two IDs per line (default: jcvi_list.txt)")
     p.add_argument("-max_ks", "--max_ks", dest="max_ks", type=float, default=2.0,
-                   help="Drop gene pairs with Ks >= this (saturation cutoff; default: 2.0)")
+                   help="Drop gene pairs with Ks >= this (saturation cutoff; default: 2.0). "
+                        "Ks = 0 is kept")
     p.add_argument("-genome_out", "--genome_out", dest="genome_out", default="ks_genome.tsv",
                    help="Per-genome-pair medians (default: ks_genome.tsv)")
     p.add_argument("-long_out", "--long_out", dest="long_out", default="ks_all.tsv",
@@ -66,10 +79,20 @@ def read_pairs(path):
     return pairs
 
 
-def read_ks(path, max_ks, verbose):
-    """Ks column of a merged KaKs table. Read by header name -- KaKs_Calculator's column
-    order shifts between methods."""
-    kept, seen, dropped = [], 0, 0
+def parse_ks(row):
+    """Ks of one KaKs_Calculator row: 'NA' is 0.0; anything unparseable is None."""
+    ks = row["Ks"]
+    if ks == "NA":
+        return 0.0
+    try:
+        return float(ks)
+    except (TypeError, ValueError):
+        return None
+
+
+def iter_ks(path):
+    """(Sequence, Ks-or-None) for every row of a merged KaKs table. Read by header name --
+    KaKs_Calculator's column order shifts between methods."""
     with open(path, newline="") as fh:
         first = fh.readline()
         if not first.strip():
@@ -87,19 +110,26 @@ def read_ks(path, max_ks, verbose):
                      f"match the {len(KAKS_COLUMNS)}-column KaKs_Calculator layout. "
                      f"First fields: {fields[:5]}")
         for row in reader:
-            seen += 1
-            try:
-                ks = float(row["Ks"])
-            except (TypeError, ValueError):
-                dropped += 1          # 'NA'/'nan' -- KaKs could not fit the model
-                continue
-            if not (0.0 < ks < max_ks):
-                dropped += 1
-                continue
+            yield row["Sequence"], parse_ks(row)
+
+
+def read_ks(path, max_ks, verbose):
+    """Ks values with 0 <= Ks < max_ks; unparseable rows and saturated pairs are dropped."""
+    kept, seen, bad, saturated = [], 0, 0, 0
+    for _, ks in iter_ks(path):
+        seen += 1
+        if ks is None:
+            bad += 1
+        elif not (0.0 <= ks < max_ks):
+            saturated += 1
+        else:
             kept.append(ks)
+    if bad:
+        print(f"WARNING: {path}: skipped {bad} row(s) with an unparseable Ks", file=sys.stderr)
     if verbose:
-        print(f"  {path}: {len(kept)}/{seen} gene pairs kept "
-              f"(0 < Ks < {max_ks}), {dropped} dropped", file=sys.stderr)
+        print(f"  {path}: {len(kept)}/{seen} gene pairs kept (0 <= Ks < {max_ks}; "
+              f"{sum(k == 0 for k in kept)} with Ks = 0), {saturated} saturated dropped",
+              file=sys.stderr)
     return kept
 
 
@@ -114,7 +144,7 @@ def main():
             ks_values = read_ks(kaks_file, args.max_ks, args.verbose)
             if not ks_values:
                 sys.exit(f"Error: no usable Ks values in {kaks_file}. "
-                         f"Every gene pair was NA or fell outside (0, {args.max_ks}).")
+                         f"Every gene pair was unparseable or had Ks >= {args.max_ks}.")
 
             median = statistics.median(ks_values)
             gout.write(f"{id1}\t{id2}\t{len(ks_values)}\t{median:.6f}\n")
