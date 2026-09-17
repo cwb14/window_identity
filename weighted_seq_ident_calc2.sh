@@ -31,6 +31,12 @@ MIN_BLOCK_SIZE=15000
 CHAIN_MAX_GAP=20000000
 CHAIN_GAP_FACTOR=1.0
 STITCH_GAPS="yes"
+# Largest size mismatch between the two sides of a gap that stitching will bridge. 5 matches
+# MAX_LEN_RATIO below, so a stitched segment is never one Step 10 then skips as skewed.
+MAX_STITCH_RATIO=5
+# A gap may be bridged only if it is no longer than this multiple of the smaller neighbouring
+# block, on both genomes -- the same rule as paf_chain_blocks.py's gap factor (Step 11b).
+STITCH_FLANK_FACTOR=1
 # Step 10 alignment. ALIGNER=minimap2 is the historical default and is unchanged.
 ALIGNER="minimap2"
 # Steps 10-19 (alignment and everything that reads the PAF). 'no' keeps Steps 1-9, the Ks
@@ -41,8 +47,8 @@ ALIGN="yes"
 # segment granularity, so a killed alignment salvages the work it finished.
 RESUME="yes"
 # block    = span each syntenic block end to end (historical).
-# genepair = span adjacent gene pairs within a block; skips the consolidator, whose 15kb
-#            merge and gap-stitching would undo the finer granularity.
+# genepair = span adjacent gene pairs within a block. The consolidator still runs: its merge is
+#            confined to one block, and stitching rarely fires because block edges are scrambled.
 # genepair is the default: it tiles the genome once with small, evenly sized
 # segments, and it discarded ~100x less sequence than block did in benchmarking.
 # block is still supported and now genuinely cuts each syntenic block once, end to
@@ -138,10 +144,17 @@ Options:
                                blocks and a faster minimap2 step in Step 10. Acts only under
                                -partition genepair; changes segment size, not continuity.
   -stitch_gaps yes|no          Fill the gap between consecutive syntenic blocks with a
-                               synthetic block, so inter-anchor intervals are aligned rather
-                               than dropped (default: $STITCH_GAPS). Guarded against inversions
-                               and rearrangements. Effectively inert in practice: gaps within
-                               one block rarely exist (see README).
+                               synthetic block, so the interval is aligned and drawn rather
+                               than dropped (default: $STITCH_GAPS). Only same-strand neighbours
+                               that are consecutive in both genomes are bridged, so inversions
+                               and rearrangements are never papered over.
+  -max_stitch_ratio N          Do not stitch a gap whose two sides differ in length by more
+                               than N-fold; 0 disables (default: $MAX_STITCH_RATIO, matching
+                               -max_len_ratio so Step 10 never skips a stitched segment).
+  -stitch_flank_factor N       Do not stitch a gap longer than N x the smaller neighbouring
+                               block, on either genome; 0 disables (default:
+                               $STITCH_FLANK_FACTOR). Stops two tiny spurious blocks from being
+                               bridged across tens of Mb.
   -kaks yes|no                 Estimate pairwise Ks on the syntenic anchors with ParaAT +
                                KaKs_Calculator, then build the Ks density plot, distance
                                matrix, and tree (default: $KAKS). Adds the in-frame CDS to
@@ -285,6 +298,14 @@ while [[ $# -gt 0 ]]; do
         STITCH_GAPS="$2"
         shift; shift
         ;;
+    -max_stitch_ratio)
+        MAX_STITCH_RATIO="$2"
+        shift; shift
+        ;;
+    -stitch_flank_factor)
+        STITCH_FLANK_FACTOR="$2"
+        shift; shift
+        ;;
     -kaks)
         KAKS="$2"
         shift; shift
@@ -342,6 +363,16 @@ fi
 
 if ! [[ "$MIN_BLOCK_SIZE" =~ ^[0-9]+$ ]]; then
     echo "Error: -min_block_size must be a non-negative integer (got '$MIN_BLOCK_SIZE')."
+    exit 1
+fi
+
+if ! [[ "$MAX_STITCH_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Error: -max_stitch_ratio must be a non-negative number (got '$MAX_STITCH_RATIO')."
+    exit 1
+fi
+
+if ! [[ "$STITCH_FLANK_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Error: -stitch_flank_factor must be a non-negative number (got '$STITCH_FLANK_FACTOR')."
     exit 1
 fi
 
@@ -442,7 +473,8 @@ if [[ "$KAKS" == "yes" ]]; then
 fi
 
 # Assembled once and reused by the consolidator in Step 8.
-CONSOLIDATOR_OPTS=(-t "$MIN_BLOCK_SIZE")
+CONSOLIDATOR_OPTS=(-t "$MIN_BLOCK_SIZE" --max-stitch-ratio "$MAX_STITCH_RATIO"
+                   --stitch-flank-factor "$STITCH_FLANK_FACTOR")
 if [[ "$STITCH_GAPS" == "yes" ]]; then
     CONSOLIDATOR_OPTS+=(--stitch-gaps)
 fi
@@ -833,7 +865,7 @@ while read -r line; do
         # intervals share an anchor gene so they always touch, and the merge was
         # transitive across a whole (chrom, chrom, strand) bin. Both the merge and
         # the gap stitching are now scoped by the block id in column 4.
-        echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS)"
+        echo "Consolidating $polished2_file to $coords_file (-t $MIN_BLOCK_SIZE, stitch_gaps=$STITCH_GAPS, max_stitch_ratio=$MAX_STITCH_RATIO, stitch_flank_factor=$STITCH_FLANK_FACTOR)"
         python "$BIN_DIR/anchor_coord_consolidator.py" "${CONSOLIDATOR_OPTS[@]}" "$polished2_file" >"$coords_file"
     else
         echo "Coords file $coords_file exists. Skipping."

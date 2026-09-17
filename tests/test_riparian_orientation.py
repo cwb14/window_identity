@@ -197,3 +197,32 @@ def test_filter_pair_blocks_transposes_and_filters():
                      "gb": "D", "cb": "D_chr1", "sb": 0, "eb": 50 * M, "strand": "-"}]
     assert stats == {"raw": 3, "off_chrom": 1, "small": 1, "clean": 1, "rescued": 0,
                      "dropped": 0}
+
+
+# ---------------------------------------------------------------- ribbon styling
+
+def test_rescued_ribbons_draw_like_any_other(tmp_path, monkeypatch):
+    # A rescued block (length-skewed but the only evidence for its locus) is kept as real
+    # synteny everywhere else, so it must not be singled out with a dashed outline.
+    up, dn, blocks = two_pair_scene()
+    blocks[1] = dict(blocks[1], rescued=True, ratio=8.0, novelty=1.0)
+    rp.optimise_track(dn, up, blocks, do_order=False)
+    dn.relayout(0)
+    scene = rp.build_scene(["U", "D"], {"U": up, "D": dn}, {("U", "D"): blocks},
+                           rp.build_palette(list(up.lens)), "U", "bp", max(up.span, dn.span))
+    assert sum(r["rescued"] for r in scene["ribbons"]) == 1
+
+    styles, real_patch = [], rp.PathPatch
+
+    def spy(path, **kw):
+        styles.append({k: kw.get(k) for k in ("edgecolor", "alpha", "linewidth", "linestyle")})
+        return real_patch(path, **kw)
+    monkeypatch.setattr(rp, "PathPatch", spy)
+    rp.render_mpl(scene, [str(tmp_path / "p.png")], 11, 3.8, 72, 0.6, 0.6)
+    assert len(styles) == len(scene["ribbons"])
+    assert all(s == styles[0] for s in styles)
+
+    rp.render_html(scene, str(tmp_path / "p.html"), 0.6, 0.6)
+    page = (tmp_path / "p.html").read_text()
+    assert "stroke-dasharray" not in page
+    assert page.count('fill-opacity="0.6" stroke="none"') == len(scene["ribbons"])

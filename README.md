@@ -50,9 +50,11 @@ and a tuning recipe are in [TUNING.md](TUNING.md). In short:
   - cd-hit deduplication does not rescue a bloated proteome.
 - **`-outn 1` and `-outs 0.99` help** on large proteomes (fewer paralog copies). `-outs 0.8` badly
   fragments blocks. `-tesorter yes` helps modestly.
-- **`-outc`, `-min_block_size` and `-stitch_gaps` do not change continuity.** With
-  `-partition block` the last two give byte-identical output. Under `genepair`,
-  `-min_block_size` only sets segment size.
+- **`-outc` and `-min_block_size` do not change continuity.** `-min_block_size` only sets
+  segment size under `genepair`, and does nothing under `block`.
+- **`-stitch_gaps yes` closes small gaps between adjacent same-strand blocks.** On the best
+  proteome it cut the chr1/chr2 gap fraction from 1.2% to 0.4%. The sweep first reported no
+  effect because a bug had disabled stitching; see below.
 - **Use `-partition block` for ribbon figures.**
 - **Polyploids:** give each subgenome its own FASTA with `chr1`..`chrN` headers. Non-`chr`
   headers are treated as scaffolds and may be dropped.
@@ -224,22 +226,32 @@ sequence between anchors, including large gene deserts:
 - `gene_coords_extractor_all4_pairs.py` (`-partition genepair`) spans each consecutive anchor
   pair.
 
-Column 4 is the block id, and the consolidator merges and stitches only within one block. So in
-practice stitching adds nothing:
+Column 4 is the block id. Merging (`-min_block_size`) is confined to one block, so a merge can
+never run down a whole chromosome arm. Gaps, however, only exist *between* blocks, so stitching
+works across blocks: it considers consecutive records of the same chromosome pair and strand.
+A gap is stitched only if all of these hold:
 
-- Under `block`, each bin holds a single record.
-- Under `genepair`, consecutive segments share an anchor gene and always touch.
+- no opposite-strand block sits in it (an inversion);
+- the two neighbours are consecutive in both genomes (not a rearrangement);
+- its two sides differ in length by at most `-max_stitch_ratio`;
+- on each genome it is no longer than `-stitch_flank_factor` × the smaller neighbouring block.
+  Without this last guard, two tiny spurious blocks on non-homologous chromosomes were bridged
+  across up to 75 Mb, and those fake blocks displaced real ones in the riparian plot.
 
-Measured on four *Poa* genome pairs, `-stitch_gaps yes` and `no` gave byte-identical coords in
-every block test, and in 15 of 16 genepair tests (the exception added one record). See
-[TUNING.md](TUNING.md).
+Stitching mostly acts under `-partition block`. Under `genepair` the segments at block edges
+are locally scrambled, so the guards usually refuse; the final *Poa* genepair runs stitched
+nothing.
+
+(An earlier version grouped stitching by block id as well, so it could never find a gap and
+silently did nothing. Re-scored with stitching restored and guarded, the 27-run sweep kept
+every ranking, and no run lost coverage.)
 
 Block orientation (column 3) is the majority vote of every anchor's relative gene strand; ties go
 to anchor order. A genepair segment whose two anchors disagree takes its block's majority.
 (Earlier versions used a block's first and last anchor only. That mislabelled 7–22% of block bp
 on the *Poa* data, and riparian drew those blocks as inverted.)
 
-Two knobs control it:
+The knobs:
 
 ```
 -min_block_size N     # default 15000. Blocks with BOTH sides >= N are kept as-is; smaller
@@ -247,7 +259,9 @@ Two knobs control it:
                       # more aggressively -> fewer, bigger blocks -> faster minimap2 in Step 10.
                       # Acts only under -partition genepair, and changes segment size, not
                       # which sequence is syntenic.
--stitch_gaps yes|no   # default yes. Effectively inert (see above).
+-stitch_gaps yes|no         # default yes
+-max_stitch_ratio N         # default 5 (matches -max_len_ratio); 0 disables
+-stitch_flank_factor N      # default 1: gap <= N x smaller neighbouring block; 0 disables
 ```
 
 Note `-min_block_size` was previously hard-coded to 1000000, which merged almost every block.

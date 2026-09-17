@@ -830,16 +830,10 @@ def render_mpl(scene, out_paths, width, height, dpi, alpha, linewidth):
                  Path.LINETO,
                  Path.CURVE4, Path.CURVE4, Path.CURVE4,
                  Path.CLOSEPOLY]
-        # Rescued (length-skewed) blocks get a dashed outline: they are the only
-        # evidence at their locus, but they are still degenerate, and the static
-        # figure must not present them with the same confidence as a clean block.
-        if r["rescued"]:
-            ax.add_patch(PathPatch(Path(verts, codes), facecolor=r["color"],
-                                   edgecolor=r["color"], alpha=alpha * 0.8,
-                                   linewidth=0.5, linestyle=(0, (2, 1.5))))
-        else:
-            ax.add_patch(PathPatch(Path(verts, codes), facecolor=r["color"],
-                                   edgecolor="none", alpha=alpha, linewidth=0))
+        # Rescued (length-skewed) blocks are drawn like any other: they are kept as real
+        # synteny for orientation and coverage, and a distinct outline only distracted.
+        ax.add_patch(PathPatch(Path(verts, codes), facecolor=r["color"],
+                               edgecolor="none", alpha=alpha, linewidth=0))
 
     # Plain rectangles: x is in unit-genome space and y in track units, so any
     # corner rounding expressed in data coordinates comes out as an ellipse.
@@ -1046,13 +1040,10 @@ def render_html(scene, out_path, alpha, linewidth, px_w=1500, px_track=250):
              f'L{b1:.2f},{yb:.2f} '
              f'C{b1:.2f},{c2:.2f} {a1:.2f},{c1:.2f} {a1:.2f},{yt:.2f} Z')
         size = f'{_fmt_bp(r["len_up"])} / {_fmt_bp(r["len_dn"])}'
-        if r["rescued"]:
-            style = (f'fill-opacity="{alpha * 0.8}" stroke="{r["color"]}" '
-                     f'stroke-width="0.8" stroke-dasharray="3 2"')
-            note = f'rescued &#183; {r["ratio"]:.0f}x length-skew, only evidence here'
-        else:
-            style = f'fill-opacity="{alpha}" stroke="none"'
-            note = ""
+        # Same style for every ribbon; a rescued block is only noted in its hover text.
+        style = f'fill-opacity="{alpha}" stroke="none"'
+        note = (f'rescued &#183; {r["ratio"]:.0f}x length-skew, only evidence here'
+                if r["rescued"] else "")
         o.append(
             f'      <path class="rib" d="{d}" fill="{r["color"]}" {style} '
             f'data-up="{html.escape(r["up"])}" data-dn="{html.escape(r["dn"])}" '

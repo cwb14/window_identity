@@ -3,18 +3,22 @@ import sys
 import argparse
 
 def process_file(infile: str, threshold: int, stitch_gaps: bool,
-                 max_stitch_ratio: float = 3.0):
+                 max_stitch_ratio: float = 5.0, stitch_flank_factor: float = 1.0):
     """
     Process the anchors coordinate file to merge lines based on overlapping
-    or touching (butt heads) sequence ranges, per (pair1_id, pair2_id, strand) bin.
+    or touching (butt heads) sequence ranges, per (pair1_id, pair2_id, strand, block) bin.
 
     A pair is considered "pass" if both lengths >= threshold; otherwise "fail".
-    Only lines where at least one side is "fail" are eligible to merge.
-    After merging, the merged record's status becomes "pass".
+    Only lines where at least one side is "fail" are eligible to merge, so a merge
+    never crosses a syntenic block.
 
-    If --stitch-gaps is set, after merging we insert synthetic lines to fill
-    gaps between consecutive records within each bin (same pair1_id, pair2_id, strand)
-    whenever both sequences have a positive gap. Touching intervals (no gap) are not stitched.
+    If --stitch-gaps is set, after merging we insert synthetic lines to fill gaps
+    between consecutive records of the same (pair1_id, pair2_id, strand) -- ACROSS
+    blocks, since that is the only place a gap exists -- whenever both sequences have
+    a positive gap. Touching intervals (no gap) are not stitched. Guards: no opposite-
+    strand record in the gap, consecutive in both genomes, gap sizes within
+    max_stitch_ratio of each other, and each gap no longer than stitch_flank_factor x the
+    smaller neighbouring block on that genome.
     """
     # ---------- parsing ----------
     bins = {}
@@ -149,20 +153,26 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool,
                     return True
             return False
 
-        for bin_key, lines in final_bins.items():
-            if not lines:
+        # Stitch groups span blocks. The merge bins above carry the block id so a merge can
+        # never run across blocks, but a gap only ever exists BETWEEN blocks: stitching within
+        # a merge bin (as after 829e382) can never find one. Group by chromosome pair + strand.
+        stitch_groups = defaultdict(list)
+        for _lines in final_bins.values():
+            for rec in _lines:
+                stitch_groups[(rec[0], rec[3], rec[6])].append(rec)
+
+        for lines in stitch_groups.values():
+            if len(lines) < 2:
                 continue
 
-            # Build dual orderings within THIS bin (same pair1_id, pair2_id, strand)
+            # Build dual orderings within THIS group (same pair1_id, pair2_id, strand)
             lines_by_p1 = sorted(lines, key=lambda x: (x[1], x[4]))  # pair1_start then pair2_start
             lines_by_p2 = sorted(lines, key=lambda x: (x[4], x[1]))  # pair2_start then pair1_start
 
             # Map "identity" of a record to its index in pair2-order for quick adjacency checks
             pos_in_p2 = {id(rec): idx for idx, rec in enumerate(lines_by_p2)}
 
-            stitched = []
             for prev, nxt in zip(lines_by_p1, lines_by_p1[1:]):
-                stitched.append(prev)
 
                 # Positive gaps on both sequences?
                 gap1_start, gap1_end = prev[2], nxt[1]
@@ -192,23 +202,30 @@ def process_file(infile: str, threshold: int, stitch_gaps: bool,
                 if max_stitch_ratio > 0 and max(g1, g2) > max_stitch_ratio * min(g1, g2):
                     continue
 
-                # If both guards pass, insert the synthetic line
-                stitched.append([
+                # GUARD #4: the gap must be backed by synteny on both sides -- no longer
+                # than stitch_flank_factor x the smaller neighbouring block, on each genome.
+                # Without it, two tiny spurious blocks on a non-homologous chromosome pair
+                # pass every guard above and were stitched across 75 Mb, and the fake block
+                # then displaced real (rescued) blocks in the riparian plot. Same principle
+                # as paf_chain_blocks.py --max-gap-factor.
+                if stitch_flank_factor > 0 and (
+                        g1 > stitch_flank_factor * min(prev[2] - prev[1], nxt[2] - nxt[1]) or
+                        g2 > stitch_flank_factor * min(prev[5] - prev[4], nxt[5] - nxt[4])):
+                    continue
+
+                # All guards pass: insert the synthetic record into the left neighbour's
+                # bin, so it prints right after that record and the order of existing
+                # records never changes.
+                final_bins[prev[9]].append([
                     prev[0], gap1_start, gap1_end,
                     prev[3], gap2_start, gap2_end,
                     prev[6],
                     gap1_end - gap1_start,
                     gap2_end - gap2_start,
-                    bin_key,
+                    prev[9],
                     "stitched",  # internal marker; output format ignores this
-                    prev[11]     # a stitched gap belongs to the block it sits inside
+                    prev[11]     # block id of the left neighbour; nothing downstream reads it
                 ])
-
-            # append the last original record (in pair1 order)
-            stitched.append(lines_by_p1[-1])
-
-            # Keep stitched list sorted for deterministic output
-            final_bins[bin_key] = sorted(stitched, key=lambda x: (x[1], x[4]))
 
     # ---------- output ----------
     # Flatten bins in insertion order; within bin keep sorted order for determinism
@@ -242,11 +259,20 @@ def main():
     parser.add_argument(
         "--max-stitch-ratio",
         type=float,
-        default=3.0,
+        default=5.0,
         help="Do not stitch a gap pair whose two sides differ by more than this "
-             "factor; 0 disables the check (default: %(default)s). A 50 Mb vs 10 Mb "
-             "stitch asserts a correspondence the anchors never showed, and the "
-             "resulting segment is unalignable end-to-end."
+             "factor; 0 disables the check (default: %(default)s, the same limit Step 10 "
+             "and riparian apply to skewed segments). A 50 Mb vs 5 Mb stitch asserts a "
+             "correspondence the anchors never showed, and the resulting segment is "
+             "unalignable end-to-end."
+    )
+    parser.add_argument(
+        "--stitch-flank-factor",
+        type=float,
+        default=1.0,
+        help="Do not stitch a gap longer than this multiple of the smaller neighbouring "
+             "block, on either genome; 0 disables the check (default: %(default)s). Keeps "
+             "two tiny spurious blocks from being bridged across tens of Mb."
     )
     args = parser.parse_args()
 
@@ -255,7 +281,7 @@ def main():
         sys.exit(2)
 
     process_file(args.infile, args.threshold, args.stitch_gaps,
-                 args.max_stitch_ratio)
+                 args.max_stitch_ratio, args.stitch_flank_factor)
 
 if __name__ == "__main__":
     main()

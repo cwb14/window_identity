@@ -14,7 +14,7 @@ than any other option.
 | `-tesorter` | `yes` (default). | Modest gain; cheap with a curated proteome |
 | `-outc` | Leave at the default. | None (0.1, 0.5 and 0.9 were indistinguishable) |
 | `-min_block_size` | Sets segment size under `-partition genepair`; no role under `block`. | **No effect on continuity** in either mode |
-| `-stitch_gaps` | Leave at the default. | **None.** Byte-identical in every block test; 15 of 16 genepair tests (1 extra record once) |
+| `-stitch_gaps` | `yes` (default). | Closes small gaps between adjacent same-strand blocks: best set 0.012 → 0.004 |
 | `-partition` | `block` for ribbon (riparian) figures. | `genepair` segments are small, and riparian drops many of them |
 
 ## Why the proteome dominates
@@ -115,19 +115,27 @@ defaults.
 - **`-outn`/`-outs` on a curated proteome.** They barely matter there: `-outn 1` scored 0.0118
   vs 0.0120, and `-outs 0.99` on the 37k set scored 0.053 vs 0.048. A curated proteome has few
   paralog copies left to remove.
-- **`-min_block_size` and `-stitch_gaps` do nothing with `-partition block`.** Rerunning Step 8
-  with `-min_block_size` 0, 15 kb, 1 Mb and 50 Mb, with stitching on and off, gave byte-identical
-  `*.anchors.coords`. In block mode every record carries its own block id, and the consolidator
-  bins by block id. Each bin then holds exactly one record, so there is nothing to merge or
-  stitch.
+- **`-min_block_size` does nothing with `-partition block`.** Rerunning Step 8 with 0, 15 kb,
+  1 Mb and 50 Mb gave byte-identical `*.anchors.coords`. Merging is confined to one block, and in
+  block mode each block is a single record, so there is nothing to merge.
 - **Under `-partition genepair`, `-min_block_size` only sets granularity.** On PaA–PaB, values
   of 0, 15 kb, 100 kb and 1 Mb gave 12,575, 7,879, 3,217 and 768 segments (median 22 kb, 51 kb,
   172 kb, 1.1 Mb) over the same 1,101.830 Mb. Raise it for fewer, larger Step 10 alignment jobs.
   It does not change which sequence is syntenic.
-- **`-stitch_gaps` is effectively inert under genepair too.** Stitching on vs off was
-  byte-identical in 15 of 16 cases (4 genome pairs × 4 thresholds); the exception added one
-  record. Consecutive gene-pair segments share an anchor gene, so they always touch, and stitching
-  is confined to a single block.
+- **`-stitch_gaps` was broken during the sweep, and has since been fixed.** Stitching was
+  grouped by block id, so it never saw the between-block gaps it exists to fill. Every gap
+  fraction in this document was measured with stitching off.
+  - **Restored:** stitching now spans blocks, with a new guard that a gap must be no longer than
+    the smaller neighbouring block on each genome (`-stitch_flank_factor 1`).
+  - **Re-scored sweep:** every ranking kept, and no run lost coverage. The best set dropped from
+    0.012 to 0.004, i.e. the two small chr1 gaps (2.2 and 2.0 Mb) next to the pericentromere
+    closed.
+  - **Why the new guard matters:** without it, sparse spurious blocks on non-homologous
+    chromosomes were stitched across up to 75 Mb (313 of 1,666 stitches). Those fake blocks
+    displaced real blocks in 8 of 27 runs. With it, 800 stitches remain: 2 non-homologous (both
+    under 0.3 Mb) and none over 10 Mb.
+  - **Genepair:** block edges are locally scrambled, so the guards usually refuse; the final
+    genepair runs stitched nothing.
 
 ### Is a sparse proteome hiding real structure?
 
